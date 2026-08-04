@@ -1,0 +1,8 @@
+TASK_QUEUE_ZSET = "rds:task:queue"
+TASK_PROCESSING_ZSET = "rds:task:processing"
+TASK_RETRY_ZSET = "rds:task:retry"
+TASK_QUEUE_SCORE_HASH = "rds:task:queue:score"
+TASK_ATTEMPTS_HASH = "rds:task:attempts"
+TASK_LAST_ERROR_HASH = "rds:task:last_error"
+ROBOT_STATE_PREFIX = "rds:robot:state:"
+ALARM_PREFIX = "rds:alarm:"

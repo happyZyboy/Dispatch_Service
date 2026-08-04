@@ -1,0 +1,7 @@
+fastapi==0.138.0
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.51
+pydantic==2.11.7
+asyncmy==0.2.10
+redis==6.4.0
+aio-pika>=9.4,<10

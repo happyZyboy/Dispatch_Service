@@ -1,0 +1,18 @@
+GET http://127.0.0.1:8000/health
+Accept: application/json
+
+###
+
+POST http://127.0.0.1:8000/api/v1/tasks/submit
+Content-Type: application/json
+
+{
+  "templateLabel": "MOVE_DEFAULT",
+  "fromSite": "SITE-A-01",
+  "toSite": "SITE-B-03",
+  "priority": 8,
+  "agvId": "AGV-001",
+  "outOrderNo": "WMS202607310001",
+  "periodicTask": 0,
+  "remark": "初版任务"
+}
