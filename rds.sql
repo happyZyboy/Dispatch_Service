@@ -9,6 +9,9 @@ SET NAMES utf8mb4;
 DROP TABLE IF EXISTS `t_windtasklog`;
 DROP TABLE IF EXISTS `t_windblockrecord`;
 DROP TABLE IF EXISTS `t_windtaskrecord`;
+DROP TABLE IF EXISTS `t_mapedge`;
+DROP TABLE IF EXISTS `t_mapnode`;
+DROP TABLE IF EXISTS `t_mapversion`;
 DROP TABLE IF EXISTS `t_windtaskdef`;
 DROP TABLE IF EXISTS `t_alarmsrecord`;
 DROP TABLE IF EXISTS `robot_current_state`;
@@ -27,7 +30,7 @@ CREATE TABLE `t_robotitem` (
   `robot_type` varchar(64) DEFAULT NULL COMMENT '机器人类型',
   `enable_status` int NOT NULL DEFAULT 1 COMMENT '启用状态，0 禁用，1 启用',
   `battery_threshold` decimal(10,2) DEFAULT 20.00 COMMENT '参与自动调度的最低电量阈值',
-  `current_map` varchar(255) DEFAULT NULL COMMENT '当前地图',
+  `current_map` varchar(255) DEFAULT NULL COMMENT '当前地图名称或业务标识',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_t_robotitem_uuid` (`uuid`),
   KEY `idx_t_robotitem_del` (`del`)
@@ -59,7 +62,7 @@ CREATE TABLE `robot_current_state` (
   `current_status` int DEFAULT NULL COMMENT '当前机器人状态',
   `dispatch_status` int NOT NULL DEFAULT 0 COMMENT '当前调度状态，0 离线，1 空闲，2 忙碌，3 充电，4 故障，5 锁定',
   `current_task_id` bigint DEFAULT NULL COMMENT '当前任务记录 ID',
-  `current_site_id` varchar(64) DEFAULT NULL COMMENT '当前站点 ID',
+  `current_site_id` varchar(64) DEFAULT NULL COMMENT '当前地图节点/库位编码，必须使用 RobotShop .smap 的 instanceName',
   `current_location` varchar(255) DEFAULT NULL COMMENT '当前位置信息',
   `battery_level` decimal(10,2) DEFAULT NULL COMMENT '当前电量',
   `has_unresolved_alarm` int NOT NULL DEFAULT 0 COMMENT '是否有未恢复报警，0 无，1 有',
@@ -88,7 +91,7 @@ CREATE TABLE `t_worksite` (
   `preparing` int NOT NULL DEFAULT 0 COMMENT '是否预占',
   `row_num` varchar(255) DEFAULT NULL COMMENT '行号',
   `column_num` int DEFAULT NULL COMMENT '列号',
-  `site_id` varchar(64) NOT NULL COMMENT '库位 ID',
+  `site_id` varchar(64) NOT NULL COMMENT '库位业务编码，必须使用 RobotShop .smap advancedPointList.instanceName',
   `site_name` varchar(255) DEFAULT NULL COMMENT '库位名称',
   `sync_failed` int NOT NULL DEFAULT 0 COMMENT '是否同步失败',
   `type` int DEFAULT NULL COMMENT '库位类型',
@@ -106,6 +109,64 @@ CREATE TABLE `t_worksite` (
   KEY `idx_t_worksite_added_on` (`added_on`),
   KEY `idx_t_worksite_del` (`del`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='库位表';
+
+CREATE TABLE `t_mapversion` (
+  `id` bigint NOT NULL COMMENT '地图版本内部主键，建议使用雪花算法生成',
+  `map_name` varchar(255) NOT NULL COMMENT '地图名称，对应 .smap header.mapName',
+  `source_version` varchar(64) DEFAULT NULL COMMENT '地图源文件版本，对应 .smap header.version',
+  `map_type` varchar(64) DEFAULT NULL COMMENT '地图类型，例如 2D-Map',
+  `resolution` decimal(10,4) DEFAULT NULL COMMENT '地图分辨率，例如 0.02 米',
+  `min_x` decimal(12,4) DEFAULT NULL COMMENT '地图范围最小 X 坐标',
+  `min_y` decimal(12,4) DEFAULT NULL COMMENT '地图范围最小 Y 坐标',
+  `max_x` decimal(12,4) DEFAULT NULL COMMENT '地图范围最大 X 坐标',
+  `max_y` decimal(12,4) DEFAULT NULL COMMENT '地图范围最大 Y 坐标',
+  `source_file` varchar(512) NOT NULL COMMENT '原始 .smap 文件保存路径',
+  `file_hash` varchar(64) NOT NULL COMMENT '原始地图文件 SHA-256 哈希',
+  `node_count` int NOT NULL DEFAULT 0 COMMENT '解析出的地图节点数量',
+  `edge_count` int NOT NULL DEFAULT 0 COMMENT '解析出的拓扑边数量',
+  `status` varchar(16) NOT NULL DEFAULT 'DRAFT' COMMENT '地图状态，DRAFT 草稿，ACTIVE 当前使用，ARCHIVED 历史版本',
+  `created_on` datetime NOT NULL COMMENT '地图导入时间',
+  `activated_on` datetime DEFAULT NULL COMMENT '地图激活时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_t_mapversion_file_hash` (`file_hash`),
+  KEY `idx_t_mapversion_map_name_status` (`map_name`,`status`),
+  KEY `idx_t_mapversion_created_on` (`created_on`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='地图版本表';
+
+CREATE TABLE `t_mapnode` (
+  `id` bigint NOT NULL COMMENT '地图节点内部主键，建议使用雪花算法生成',
+  `map_version_id` bigint NOT NULL COMMENT '所属地图版本 ID，对应 t_mapversion.id',
+  `node_code` varchar(128) NOT NULL COMMENT '地图节点编码，对应 .smap advancedPointList.instanceName',
+  `node_type` varchar(64) NOT NULL COMMENT '地图节点类型，对应 .smap advancedPointList.className',
+  `x` decimal(12,4) DEFAULT NULL COMMENT '节点 X 坐标',
+  `y` decimal(12,4) DEFAULT NULL COMMENT '节点 Y 坐标',
+  `ignore_dir` int NOT NULL DEFAULT 0 COMMENT '是否忽略节点方向，0 否，1 是',
+  `properties` longtext COMMENT '地图节点原始属性 JSON',
+  `is_enabled` int NOT NULL DEFAULT 1 COMMENT '节点是否启用，0 禁用，1 启用',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_t_mapnode_version_code` (`map_version_id`,`node_code`),
+  KEY `idx_t_mapnode_version_type` (`map_version_id`,`node_type`),
+  KEY `idx_t_mapnode_enabled` (`is_enabled`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='地图节点表';
+
+CREATE TABLE `t_mapedge` (
+  `id` bigint NOT NULL COMMENT '拓扑边内部主键，建议使用雪花算法生成',
+  `map_version_id` bigint NOT NULL COMMENT '所属地图版本 ID，对应 t_mapversion.id',
+  `edge_code` varchar(255) NOT NULL COMMENT '拓扑边编码，对应 .smap advancedCurveList.instanceName',
+  `edge_type` varchar(64) DEFAULT NULL COMMENT '拓扑边类型，例如 DegenerateBezier',
+  `from_node_code` varchar(128) NOT NULL COMMENT '有向边起点节点编码',
+  `to_node_code` varchar(128) NOT NULL COMMENT '有向边终点节点编码',
+  `direction` decimal(10,4) DEFAULT NULL COMMENT '地图原始方向属性',
+  `move_style` int DEFAULT NULL COMMENT '地图原始移动方式属性',
+  `cost` decimal(19,6) DEFAULT NULL COMMENT '路径代价，默认可使用边长度',
+  `geometry` longtext COMMENT '曲线起终点和控制点等几何 JSON',
+  `is_enabled` int NOT NULL DEFAULT 1 COMMENT '拓扑边是否启用，0 禁用，1 启用',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_t_mapedge_version_code` (`map_version_id`,`edge_code`),
+  KEY `idx_t_mapedge_from_node` (`map_version_id`,`from_node_code`),
+  KEY `idx_t_mapedge_to_node` (`map_version_id`,`to_node_code`),
+  KEY `idx_t_mapedge_enabled` (`is_enabled`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='地图拓扑边表';
 
 CREATE TABLE `t_windtaskdef` (
   `id` bigint NOT NULL COMMENT '主键 ID',
@@ -147,7 +208,8 @@ CREATE TABLE `t_windtaskrecord` (
   `first_executor_time` datetime DEFAULT NULL COMMENT '首次执行时间',
   `is_del` int NOT NULL DEFAULT 0 COMMENT '删除标记(未删除=0，删除=1)',
   `out_order_no` varchar(128) DEFAULT NULL COMMENT '外部订单号',
-  `path` text COMMENT '路径信息',
+  `path` text COMMENT '任务完整路径和分段信息 JSON，节点编码使用地图 instanceName',
+  `map_version_id` bigint DEFAULT NULL COMMENT '任务实际使用的地图版本 ID，首次调度规划时确定并固定',
   `periodic_task` int NOT NULL DEFAULT 0 COMMENT '是否周期任务',
   `priority` int NOT NULL DEFAULT 0 COMMENT '优先级',
   `root_task_record_id` bigint DEFAULT NULL COMMENT '根任务记录 ID',
@@ -158,6 +220,7 @@ CREATE TABLE `t_windtaskrecord` (
   KEY `idx_t_windtaskrecord_agv_id` (`agv_id`),
   KEY `idx_t_windtaskrecord_created_on` (`created_on`),
   KEY `idx_t_windtaskrecord_out_order_no` (`out_order_no`),
+  KEY `idx_t_windtaskrecord_map_version_id` (`map_version_id`),
   KEY `idx_t_windtaskrecord_root_task_record_id` (`root_task_record_id`),
   KEY `idx_t_windtaskrecord_priority_status` (`priority`,`status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='任务执行记录表';
