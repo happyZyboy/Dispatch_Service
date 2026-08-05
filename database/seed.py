@@ -32,8 +32,7 @@ def _seed_task_defs(session: AsyncSession) -> None:
     # 默认模板只保留最小可跑链路，后面再扩展复杂 block 树。
     default_detail = {
         "inputParams": [
-            {"name": "from", "type": "String", "label": "起点", "required": True, "defaultValue": ""},
-            {"name": "to", "type": "String", "label": "终点", "required": True, "defaultValue": ""},
+            {"name": "sitePath", "type": "JSONArray", "label": "按顺序执行的库位路径", "required": True, "defaultValue": []},
             {"name": "vehicle", "type": "String", "label": "指定车辆", "required": False, "defaultValue": ""},
             {"name": "priority", "type": "Integer", "label": "优先级", "required": False, "defaultValue": 5},
         ],
@@ -91,6 +90,7 @@ async def _seed_robots(session: AsyncSession) -> None:
                 vehicle_name=robot_1.robot_name,
                 current_status=1,
                 dispatch_status=DispatchStatus.IDLE,
+                current_site_id="SITE-A-01",
                 battery_level=88,
                 last_heartbeat_at=robot_1.added_on,
             ),
@@ -100,6 +100,7 @@ async def _seed_robots(session: AsyncSession) -> None:
                 vehicle_name=robot_2.robot_name,
                 current_status=1,
                 dispatch_status=DispatchStatus.IDLE,
+                current_site_id="SITE-B-03",
                 battery_level=76,
                 last_heartbeat_at=robot_2.added_on,
             ),

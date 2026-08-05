@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerWorker:
-    """Single-task Redis consumer that reuses the existing dispatch service."""
+    """复用现有调度服务的单任务 Redis 消费 Worker。"""
 
     def __init__(self, worker_id: str | None = None) -> None:
         self.redis = get_redis()
@@ -144,11 +144,11 @@ class SchedulerWorker:
                 async with SessionLocal() as db:
                     await trigger_dispatch(db, task_id, None, False)
             except Exception:
-                logger.exception("failed to republish assigned task to RabbitMQ: task_id=%s", task_id)
+                logger.exception("重新向 RabbitMQ 投递已分配任务失败：task_id=%s", task_id)
 
 
 async def run_scheduler() -> None:
-    """Run the scheduler as a standalone process."""
+    """以独立进程方式运行调度 Worker。"""
     try:
         await SchedulerWorker().run()
     finally:

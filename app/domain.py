@@ -10,7 +10,7 @@ from common.enums.dispatch_status import DispatchStatus
 from common.enums.log_level import LogLevel
 from common.enums.robot_status import RobotStatus
 from common.enums.task_status import TaskStatus
-from common.utils import format_dt, from_json_text, now, to_json_text
+from common.utils import format_dt, from_json_text, normalize_site_path, now, to_json_text
 from database.models import AlarmRecord, RobotCurrentState, RobotStatusRecord, WindBlockRecord, WindTaskLog, WindTaskRecord
 
 TASK_STATUS_DESC = {
@@ -63,10 +63,7 @@ def serialize_block(block: WindBlockRecord) -> dict[str, Any]:
     将流程块 ORM 对象转换成接口可以直接返回的字典结构。
     """
     payload = block.to_dict()
-    payload["blockInputParams"] = from_json_text(block.block_input_params, {})
     payload["blockInputParamsValue"] = from_json_text(block.block_input_params_value, {})
-    payload["blockInternalVariables"] = from_json_text(block.block_internal_variables, {})
-    payload["inputParams"] = from_json_text(block.input_params, {})
     payload["internalVariables"] = from_json_text(block.internal_variables, {})
     payload["outputParams"] = from_json_text(block.output_params, {})
     payload["statusDesc"] = BLOCK_STATUS_DESC.get(BlockStatus(block.status), "未知")
@@ -94,6 +91,7 @@ def serialize_task(
         "defVersion": task.def_version,
         "fromSite": input_params.get("from"),
         "toSite": input_params.get("to"),
+        "sitePath": input_params.get("sitePath") or [],
         "agvId": task.agv_id,
         "priority": task.priority,
         "outOrderNo": task.out_order_no,
@@ -109,11 +107,19 @@ def serialize_task(
     }
 
 
-async def create_block_plan(session: AsyncSession, task: WindTaskRecord) -> list[WindBlockRecord]:
+def task_requested_sites(task: WindTaskRecord) -> list[str]:
+    """从任务快照中读取按顺序排列的 WMS 目标库位。"""
+    params = from_json_text(task.input_params, {})
+    return normalize_site_path(params.get("sitePath") or [])
+
+
+async def create_initial_block_plan(session: AsyncSession, task: WindTaskRecord) -> list[WindBlockRecord]:
     """
-    根据任务路径创建 Root、选车和分段动作流程块，供调度下发和 RMF 回调使用。
+    在任务提交阶段创建选车流程块和第一个占位 RootBp。
+
+    第一个 RootBp 只有在选定机器人后才能确定 ``from`` 站点，因此提交阶段先留空，
+    后续由调度服务补全。
     """
-    # 把整单路径拆成 Root / 选车 / 多段动作块，方便逐段回调。
     existing = (
         await session.scalars(
             select(WindBlockRecord).where(WindBlockRecord.task_record_id == task.id).order_by(WindBlockRecord.id.asc())
@@ -122,77 +128,161 @@ async def create_block_plan(session: AsyncSession, task: WindTaskRecord) -> list
     if existing:
         return existing
 
-    path = from_json_text(task.path, {})
-    variables = from_json_text(task.variables, {})
-    segments = path.get("segments", [])
-    route = path.get("route", [])
-    blocks: list[WindBlockRecord] = [
-        WindBlockRecord(
-            task_id=task.id,
-            task_record_id=task.id,
-            block_id=f"{task.id}-root",
-            block_name="RootBp",
-            status=BlockStatus.SUCCESS,
-            started_on=task.created_on,
-            ended_on=task.created_on,
-            block_input_params_value=to_json_text({"from": route[0] if route else None, "to": route[-1] if route else None}),
-            internal_variables=to_json_text({"taskRecordId": task.id, "stepIndex": 0, "totalSteps": len(segments)}),
-            output_params=to_json_text({}),
-        ),
-        WindBlockRecord(
-            task_id=task.id,
-            task_record_id=task.id,
-            block_id=f"{task.id}-select-agv",
-            block_name="CSelectAgvBp",
-            status=BlockStatus.SUCCESS if task.agv_id else BlockStatus.CREATED,
-            started_on=task.created_on if task.agv_id else None,
-            ended_on=task.created_on if task.agv_id else None,
-            block_input_params=to_json_text({"vehicle": {"type": "Expression", "value": "taskInputs.vehicle"}}),
-            block_input_params_value=to_json_text({"vehicle": task.agv_id or ""}),
-            output_params=to_json_text({"selectedAgvId": task.agv_id or ""}),
-            internal_variables=to_json_text({"taskRecordId": task.id, "stepIndex": 0, "totalSteps": len(segments)}),
-        ),
-    ]
-    for segment in segments:
-        step_index = segment["stepIndex"]
-        blocks.append(
-            WindBlockRecord(
-                task_id=task.id,
-                task_record_id=task.id,
-                block_id=f"{task.id}-move-{step_index}",
-                block_name="CAgvOperationBp",
-                status=BlockStatus.CREATED,
-                block_input_params=to_json_text(
-                    {
-                        "from": {"type": "Simple", "value": segment["from"], "required": True},
-                        "to": {"type": "Simple", "value": segment["to"], "required": True},
-                        "scriptName": {"type": "Simple", "value": "binTask"},
-                        "var_param": {"type": "Simple", "value": "move", "required": True},
-                    }
-                ),
-                block_input_params_value=to_json_text(
-                    {
-                        "stepIndex": step_index,
-                        "from": segment["from"],
-                        "to": segment["to"],
-                        "scriptName": "binTask",
-                        "var_param": "move",
-                    }
-                ),
-                internal_variables=to_json_text(
-                    {
-                        "taskRecordId": task.id,
-                        "stepIndex": step_index,
-                        "totalSteps": len(segments),
-                        "selectedAgvId": task.agv_id or variables.get("selectedAgvId", ""),
-                    }
-                ),
-                input_params=task.input_params,
-                output_params=to_json_text({}),
-            )
-        )
+    requested_sites = task_requested_sites(task)
+    if not requested_sites:
+        return []
+    blocks = [WindBlockRecord(
+        task_record_id=task.id,
+        block_id=f"{task.id}-select-agv",
+        block_name="CSelectAgvBp",
+        status=BlockStatus.CREATED,
+        block_input_params_value=to_json_text({"keyRoute": requested_sites[0], "vehicle": task.agv_id or ""}),
+        output_params=to_json_text({"selectedAgvId": task.agv_id or ""}),
+        internal_variables=to_json_text({"selectedAgvId": ""}),
+    ), _build_root_block(task, root_step_index=1, target_index=0, from_site=None, to_site=requested_sites[0])]
     session.add_all(blocks)
     return blocks
+
+
+def _build_root_block(
+    task: WindTaskRecord,
+    root_step_index: int,
+    target_index: int,
+    from_site: str | None,
+    to_site: str,
+) -> WindBlockRecord:
+    """为一个目标阶段创建 RootBp，动作子步骤等消息消费后再创建。"""
+    root_block_id = f"{task.id}-root-{root_step_index}"
+    common_variables = {
+        "rootStepIndex": root_step_index,
+        "targetIndex": target_index,
+        "selectedAgvId": task.agv_id or "",
+    }
+    return WindBlockRecord(
+        task_record_id=task.id,
+        block_id=root_block_id,
+        block_name="RootBp",
+        status=BlockStatus.CREATED,
+        block_input_params_value=to_json_text(
+            {"from": from_site, "to": to_site}
+        ),
+        internal_variables=to_json_text(
+            {**common_variables, "pendingStart": from_site is None}
+        ),
+        output_params=to_json_text({}),
+    )
+
+
+def build_operation_plans(
+    task: WindTaskRecord,
+    root: WindBlockRecord,
+    segments: list[dict[str, Any]],
+    script_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """把当前 RootBp 的地图路径拆成可投递给 RabbitMQ 的动作子步骤描述。"""
+    root_variables = from_json_text(root.internal_variables, {})
+    root_step_index = int(root_variables.get("rootStepIndex") or 0)
+    target_index = int(root_variables.get("targetIndex") or 0)
+    selected_agv_id = str(root_variables.get("selectedAgvId") or task.agv_id or "")
+    valid_segments = [
+        segment
+        for segment in segments
+        if segment.get("from") and segment.get("to")
+    ]
+    plans: list[dict[str, Any]] = []
+    for step_index, segment in enumerate(valid_segments, start=1):
+        from_site = segment.get("from")
+        to_site = segment.get("to")
+        plans.append(
+            {
+                "blockId": f"{root.block_id}-op-{step_index}",
+                "parentBlockId": root.block_id,
+                "blockName": "CAgvOperationBp",
+                "orderId": f"RMF-{task.id}-{root_step_index}-{step_index}",
+                "inputParams": {
+                    "from": from_site,
+                    "to": to_site,
+                    "scriptName": script_name if step_index == len(valid_segments) else None,
+                },
+                "internalVariables": {
+                    "rootStepIndex": root_step_index,
+                    "targetIndex": target_index,
+                    "selectedAgvId": selected_agv_id,
+                    "stepIndex": step_index,
+                },
+            }
+        )
+    return plans
+
+
+async def create_operation_blocks(
+    session: AsyncSession,
+    task: WindTaskRecord,
+    root: WindBlockRecord,
+    plans: list[dict[str, Any]],
+) -> list[WindBlockRecord]:
+    """RabbitMQ 消费后幂等创建当前 RootBp 的动作子步骤。"""
+    existing = (
+        await session.scalars(
+            select(WindBlockRecord).where(
+                WindBlockRecord.task_record_id == task.id,
+                WindBlockRecord.parent_block_id == root.block_id,
+                WindBlockRecord.block_name == "CAgvOperationBp",
+            )
+        )
+    ).all()
+    existing_by_id = {block.block_id: block for block in existing}
+    blocks: list[WindBlockRecord] = []
+    for plan in plans:
+        block_id = str(plan["blockId"])
+        block = existing_by_id.get(block_id)
+        if block is None:
+            block = WindBlockRecord(
+                task_record_id=task.id,
+                parent_block_id=root.block_id,
+                block_id=block_id,
+                block_name=str(plan.get("blockName") or "CAgvOperationBp"),
+                order_id=str(plan.get("orderId") or ""),
+                status=BlockStatus.CREATED,
+                block_input_params_value=to_json_text(plan.get("inputParams") or {}),
+                internal_variables=to_json_text(plan.get("internalVariables") or {}),
+                output_params=to_json_text({}),
+            )
+            session.add(block)
+        blocks.append(block)
+    await session.flush()
+    return blocks
+
+
+async def create_next_root_block(
+    session: AsyncSession,
+    task: WindTaskRecord,
+    from_site: str,
+    target_index: int,
+) -> list[WindBlockRecord]:
+    """只有当前 RootBp 完成后，才创建下一个 RootBp。"""
+    requested_sites = task_requested_sites(task)
+    if target_index >= len(requested_sites):
+        return []
+    root_step_index = target_index + 1
+    root_block_id = f"{task.id}-root-{root_step_index}"
+    existing = await session.scalar(
+        select(WindBlockRecord).where(
+            WindBlockRecord.task_record_id == task.id,
+            WindBlockRecord.block_id == root_block_id,
+        )
+    )
+    if existing:
+        return [existing]
+    block = _build_root_block(
+        task,
+        root_step_index=root_step_index,
+        target_index=target_index,
+        from_site=from_site,
+        to_site=requested_sites[target_index],
+    )
+    session.add(block)
+    return [block]
 
 
 async def mark_robot_busy(session: AsyncSession, uuid: str, task_id: int, current_site_id: str | None = None) -> None:
@@ -266,22 +356,22 @@ async def refresh_alarm_snapshot(session: AsyncSession, vehicle_id: str) -> None
 
 async def update_task_progress(session: AsyncSession, task: WindTaskRecord) -> None:
     """
-    根据已完成的动作流程块计算任务当前进度，并回写任务变量。
+    根据已完成的 RootBp 计算任务当前进度，并回写任务变量。
     """
-    # 只按已完成的动作块回推整单进度，避免把中间态算进去。
-    blocks = (
+    roots = (
         await session.scalars(
-            select(WindBlockRecord).where(WindBlockRecord.task_record_id == task.id, WindBlockRecord.block_name == "CAgvOperationBp").order_by(WindBlockRecord.id.asc())
+            select(WindBlockRecord)
+            .where(WindBlockRecord.task_record_id == task.id, WindBlockRecord.block_name == "RootBp")
+            .order_by(WindBlockRecord.id.asc())
         )
     ).all()
-    completed = sum(1 for block in blocks if block.status == BlockStatus.SUCCESS)
+    completed = sum(1 for root in roots if root.status == BlockStatus.SUCCESS)
+    requested_sites = task_requested_sites(task)
     variables = from_json_text(task.variables, {})
-    path = from_json_text(task.path, {})
-    route = path.get("route", [])
     variables["currentStepIndex"] = completed
-    variables["totalSteps"] = len(blocks)
-    if completed < len(route):
-        variables["currentSite"] = route[completed]
-    if completed + 1 < len(route):
-        variables["nextSite"] = route[completed + 1]
+    variables["totalSteps"] = len(requested_sites)
+    if completed > 0 and completed <= len(requested_sites):
+        variables["currentSite"] = requested_sites[completed - 1]
+    if completed < len(requested_sites):
+        variables["nextSite"] = requested_sites[completed]
     task.variables = to_json_text(variables)

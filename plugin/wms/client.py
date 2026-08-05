@@ -12,5 +12,5 @@ class WmsClient:
         """
         向 WMS 模拟通知任务状态变化，并返回通知结果。
         """
-        logger.info("wms notify_task_change: %s", payload)
+        logger.info("WMS 任务状态变更通知：%s", payload)
         return {"success": True, "payload": payload}

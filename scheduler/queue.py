@@ -17,7 +17,7 @@ from common.constant.redis_key import (
 from core.conf import settings
 
 
-# A lower score is consumed first. Priority 10 is the highest priority.
+# 分数越低越先被消费，优先级 10 最高。
 _PRIORITY_BUCKET = 1_000_000_000_000
 _MAX_PRIORITY = 10
 
@@ -74,7 +74,7 @@ class TaskClaim:
 
 
 class TaskQueue:
-    """Redis queue operations used by the API and the scheduler worker."""
+    """API 和调度 Worker 共用的 Redis 队列操作。"""
 
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
@@ -86,7 +86,7 @@ class TaskQueue:
         return (_MAX_PRIORITY - priority) * _PRIORITY_BUCKET + created_ms
 
     async def enqueue(self, task_id: int, priority: int, created_on: datetime | None = None) -> bool:
-        """Put a task into the pending pool unless it is currently being processed."""
+        """将任务放入待调度池，任务正在处理时不重复入队。"""
         member = str(task_id)
         score = self.score_for(priority, created_on)
         result = await self.redis.eval(
@@ -102,8 +102,8 @@ class TaskQueue:
         return bool(result)
 
     async def claim(self, worker_id: str) -> TaskClaim | None:
-        """Atomically move the next task into the processing lease."""
-        del worker_id  # The lease is represented by the processing ZSET for now.
+        """原子地将下一个任务移动到处理中租约集合。"""
+        del worker_id  # 当前暂时使用处理中 ZSET 表示租约。
         lease_until = time.time() + settings.scheduler_lease_seconds
         result = await self.redis.eval(
             _CLAIM_SCRIPT,
@@ -118,7 +118,7 @@ class TaskQueue:
         return TaskClaim(task_id=int(result[0]), attempt=int(result[1]))
 
     async def ack(self, task_id: int) -> None:
-        """Remove all queue metadata after the database operation succeeds."""
+        """数据库操作成功后，删除任务的全部队列元数据。"""
         member = str(task_id)
         pipeline = self.redis.pipeline(transaction=True)
         pipeline.zrem(TASK_QUEUE_ZSET, member)
@@ -130,7 +130,7 @@ class TaskQueue:
         await pipeline.execute()
 
     async def schedule_retry(self, task_id: int, delay_seconds: int, error: str) -> None:
-        """Move a failed task to the delayed retry pool."""
+        """将失败任务移动到延迟重试池。"""
         member = str(task_id)
         retry_at = time.time() + delay_seconds
         pipeline = self.redis.pipeline(transaction=True)
@@ -152,7 +152,7 @@ class TaskQueue:
         return int(result or 0)
 
     async def requeue_expired(self, limit: int) -> int:
-        """Return tasks whose processing lease expired to the retry pool."""
+        """将处理中租约已过期的任务放回重试池。"""
         result = await self.redis.eval(
             _REQUEUE_EXPIRED_SCRIPT,
             2,

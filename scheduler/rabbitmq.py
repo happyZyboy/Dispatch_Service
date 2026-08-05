@@ -8,7 +8,7 @@ from core.conf import settings
 
 
 class RabbitMqClient:
-    """Small async RabbitMQ client shared by publishers and consumers."""
+    """供消息发布者和消费者共用的轻量异步 RabbitMQ 客户端。"""
 
     def __init__(self) -> None:
         self._connection: Any = None
@@ -38,7 +38,7 @@ class RabbitMqClient:
             try:
                 import aio_pika
             except ImportError as exc:
-                raise RuntimeError("aio-pika is required for RabbitMQ support") from exc
+                raise RuntimeError("使用 RabbitMQ 必须安装 aio-pika 依赖") from exc
 
             self._connection = await aio_pika.connect_robust(settings.rabbitmq_url)
             self._channel = await self._connection.channel(publisher_confirms=True)

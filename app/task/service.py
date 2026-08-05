@@ -6,7 +6,7 @@ from redis.exceptions import RedisError as RedisClientError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import create_task_log, mark_robot_idle, serialize_task
+from app.domain import create_initial_block_plan, create_task_log, mark_robot_idle, serialize_task
 from common.enums.task_status import TaskStatus
 from common.exception.base import ResourceUnavailableError, RobotNotFoundError, SiteNotFoundError, StatusNotAllowedError, TaskNotFoundError, TemplateNotFoundError
 from common.utils import build_route, from_json_text, normalize_site_path, now, paginate, to_json_text
@@ -50,7 +50,7 @@ async def submit_task(
         "currentSite": None,
         "nextSite": requested_sites[0],
         "selectedAgvId": agv_id or "",
-        "requestedSites": requested_sites,
+        "sitePath": requested_sites,
         "remark": remark or "",
     }
     input_params = {
@@ -58,6 +58,7 @@ async def submit_task(
         "to": requested_sites[-1],
         "sitePath": requested_sites,
         "vehicle": agv_id or "",
+        "scriptName": None,
         "priority": priority,
         "remark": remark or "",
     }
@@ -78,7 +79,27 @@ async def submit_task(
     )
     db.add(task)
     await db.flush()
+    await create_initial_block_plan(db, task)
+    await db.flush()
     create_task_log(db, task.id, f"任务创建成功，WMS 路径={requested_sites}")
+    if agv_id:
+        from app.dispatch.service import trigger_dispatch
+
+        dispatch_result = await trigger_dispatch(db, task.id, agv_id, False)
+        await db.refresh(task)
+        return {
+            "taskId": str(task.id),
+            "status": task.status,
+            "fromSite": from_json_text(task.input_params, {}).get("from"),
+            "toSite": requested_sites[-1],
+            "sitePath": requested_sites,
+            "agvId": agv_id,
+            "outOrderNo": out_order_no,
+            "priority": priority,
+            "createdOn": task.to_dict()["created_on"],
+            "queueStatus": "DIRECT_DISPATCH",
+            "dispatch": dispatch_result,
+        }
     await db.commit()
     await db.refresh(task)
     queue_status = await _enqueue_after_commit(task)
@@ -160,6 +181,7 @@ async def cancel_task(db: AsyncSession, task_id: int, reason: str | None) -> dic
     create_task_log(db, task.id, f"任务已取消：{task.ended_reason}")
     if task.agv_id:
         await mark_robot_idle(db, task.agv_id, _task_target_site(task))
+        await _release_reserved_sites(db, task)
     await db.commit()
     await _remove_from_queue(task.id)
     return {"taskId": str(task.id), "status": task.status, "endedOn": task.to_dict()["ended_on"]}
@@ -194,6 +216,7 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
     cloned.variables = to_json_text(variables)
     db.add(cloned)
     await db.flush()
+    await create_initial_block_plan(db, cloned)
     create_task_log(db, cloned.id, f"任务由 {source.id} 重试创建")
     create_task_log(db, source.id, f"任务触发重试，新任务={cloned.id}")
     await db.commit()
@@ -207,7 +230,7 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
 
 
 async def _enqueue_after_commit(task: WindTaskRecord) -> str:
-    """Enqueue a committed task without hiding the durable MySQL record."""
+    """在任务提交后进入队列，同时保留已持久化的 MySQL 任务记录。"""
     try:
         enqueued = await TaskQueue(get_redis()).enqueue(task.id, task.priority, task.created_on)
     except RedisClientError:
@@ -273,3 +296,19 @@ def _task_target_site(task: WindTaskRecord) -> str | None:
     """
     payload = from_json_text(task.input_params, {})
     return payload.get("to")
+
+
+async def _release_reserved_sites(db: AsyncSession, task: WindTaskRecord) -> None:
+    """释放按任务路径预留的所有站点。"""
+    params = from_json_text(task.input_params, {})
+    path = from_json_text(task.path, {})
+    site_ids = set(path.get("route") or params.get("sitePath") or []) - {None}
+    if not site_ids:
+        return
+    sites = (await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))).all()
+    for site in sites:
+        if site.agv_id not in {None, task.agv_id}:
+            continue
+        site.preparing = 0
+        site.agv_id = None
+        site.holder = 0

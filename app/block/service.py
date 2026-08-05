@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import create_task_log, mark_robot_idle, refresh_alarm_snapshot, update_task_progress
+from app.domain import create_next_root_block, create_task_log, mark_robot_idle, refresh_alarm_snapshot, task_requested_sites, update_task_progress
 from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
 from common.exception.base import InvalidRmfCallbackError, TaskNotFoundError
@@ -24,6 +24,10 @@ async def handle_block_result(db: AsyncSession, payload) -> dict:
     block = await _locate_block(db, payload)
     block.status = BlockStatus.RUNNING
     block.started_on = block.started_on or now()
+    root = await _get_parent_root(db, block)
+    if root and root.status == BlockStatus.CREATED:
+        root.status = BlockStatus.RUNNING
+        root.started_on = root.started_on or block.started_on
     if payload.orderId:
         block.order_id = payload.orderId
     task.status = TaskStatus.DISPATCHED
@@ -42,6 +46,10 @@ async def handle_block_progress(db: AsyncSession, payload) -> dict:
     block = await _locate_block(db, payload)
     block.status = BlockStatus.RUNNING
     block.started_on = block.started_on or now()
+    root = await _get_parent_root(db, block)
+    if root and root.status == BlockStatus.CREATED:
+        root.status = BlockStatus.RUNNING
+        root.started_on = root.started_on or block.started_on
     progress = from_json_text(block.output_params, {})
     progress["progress"] = payload.progress
     progress.update(payload.detail)
@@ -59,32 +67,86 @@ async def handle_block_complete(db: AsyncSession, payload) -> dict:
     """
     处理单个流程块完成回调，并在全部动作块完成后结束整项任务。
     """
-    # 单个动作块完成后，检查整单是否还有未完成动作块。
+    # 单个动作块完成后，只检查它所属的 RootBp；整条任务的下一个 RootBp
+    # 必须等当前 RootBp 完成并收到 RMF 到达回调后再创建。
     task = await _get_task(db, payload.taskRecordId)
     block = await _locate_block(db, payload)
+    if block.status == BlockStatus.SUCCESS:
+        return {"taskId": str(task.id), "blockId": block.block_id, "status": block.status, "taskStatus": task.status}
     block.status = BlockStatus.SUCCESS
     block.started_on = block.started_on or now()
     block.ended_on = now()
     output = from_json_text(block.output_params, {})
     output.update(payload.detail)
     block.output_params = to_json_text(output)
-    await update_task_progress(db, task)
     create_task_log(db, task.id, payload.message or f"流程块 {block.block_id} 执行完成", task_block_id=block.id)
+
+    root = await _get_parent_root(db, block)
+    if root is None:
+        raise InvalidRmfCallbackError("RMF 回调数据非法：动作块没有所属 RootBp")
 
     remaining = (
         await db.scalars(
             select(WindBlockRecord).where(
                 WindBlockRecord.task_record_id == task.id,
+                WindBlockRecord.parent_block_id == root.block_id,
                 WindBlockRecord.block_name == "CAgvOperationBp",
                 WindBlockRecord.status != BlockStatus.SUCCESS,
             )
         )
     ).all()
-    if not remaining:
+    if remaining:
+        task.status = TaskStatus.EXECUTING
+        await update_task_progress(db, task)
+        rmf_client.report_complete({"taskId": task.id, "blockId": block.block_id})
+        await db.commit()
+        return {"taskId": str(task.id), "blockId": block.block_id, "status": block.status, "taskStatus": task.status}
+
+    root.status = BlockStatus.SUCCESS
+    root.started_on = root.started_on or block.started_on or now()
+    root.ended_on = now()
+    root.output_params = to_json_text({"arrived": True, "currentSite": _block_to_site(block)})
+    root_variables = from_json_text(root.internal_variables, {})
+    target_index = int(root_variables.get("targetIndex") or 0)
+    root_variables["arrived"] = True
+    root.internal_variables = to_json_text(root_variables)
+    await update_task_progress(db, task)
+    rmf_client.report_complete({"taskId": task.id, "blockId": block.block_id, "rootBlockId": root.block_id})
+
+    requested_sites = task_requested_sites(task)
+    next_target_index = target_index + 1
+    if next_target_index >= len(requested_sites):
         await _finish_task(db, task)
-    rmf_client.report_complete({"taskId": task.id, "blockId": block.block_id})
+        await db.commit()
+        return {"taskId": str(task.id), "blockId": block.block_id, "rootBlockId": root.block_id, "status": block.status, "taskStatus": task.status}
+
+    arrived_site = _block_to_site(block) or requested_sites[target_index]
+    next_blocks = await create_next_root_block(db, task, arrived_site, next_target_index)
+    task.status = TaskStatus.ASSIGNED
+    variables = from_json_text(task.variables, {})
+    variables["currentSite"] = arrived_site
+    variables["nextSite"] = requested_sites[next_target_index]
+    variables["rmfPublished"] = False
+    variables.pop("rmfDispatchKey", None)
+    variables.pop("rmfTaskId", None)
+    task.variables = to_json_text(variables)
+    create_task_log(db, task.id, f"RootBp 已完成，准备创建下一个 RootBp：{next_blocks[0].block_id}")
+    await db.flush()
     await db.commit()
-    return {"taskId": str(task.id), "blockId": block.block_id, "status": block.status, "taskStatus": task.status}
+
+    # 重新复用调度入口，只发布新创建的 RootBp，不重复选车。
+    from app.dispatch.service import trigger_dispatch
+
+    dispatch_result = await trigger_dispatch(db, task.id, task.agv_id, False)
+    return {
+        "taskId": str(task.id),
+        "blockId": block.block_id,
+        "rootBlockId": root.block_id,
+        "nextRootBlockId": next_blocks[0].block_id,
+        "status": block.status,
+        "taskStatus": task.status,
+        "nextDispatch": dispatch_result,
+    }
 
 
 async def handle_block_failed(db: AsyncSession, payload) -> dict:
@@ -97,7 +159,12 @@ async def handle_block_failed(db: AsyncSession, payload) -> dict:
     block.status = BlockStatus.FAILED
     block.started_on = block.started_on or now()
     block.ended_on = now()
-    block.ended_reason = payload.message or "rmf failed"
+    block.ended_reason = payload.message or "RMF 执行失败"
+    root = await _get_parent_root(db, block)
+    if root:
+        root.status = BlockStatus.FAILED
+        root.ended_on = now()
+        root.ended_reason = block.ended_reason
     task.status = TaskStatus.FAILED
     task.ended_on = now()
     task.ended_reason = block.ended_reason
@@ -124,26 +191,52 @@ async def _finish_task(db: AsyncSession, task: WindTaskRecord) -> None:
     await _release_task_sites(db, task, success=True)
 
 
+async def _get_parent_root(db: AsyncSession, block: WindBlockRecord) -> WindBlockRecord | None:
+    """返回拥有该动作流程块的 RootBp。"""
+    if block.block_name == "RootBp":
+        return block
+    if not block.parent_block_id:
+        return None
+    return await db.scalar(
+        select(WindBlockRecord).where(
+            WindBlockRecord.task_record_id == block.task_record_id,
+            WindBlockRecord.block_id == block.parent_block_id,
+            WindBlockRecord.block_name == "RootBp",
+        )
+    )
+
+
+def _block_to_site(block: WindBlockRecord) -> str | None:
+    """提取 RMF 回调或动作流程块输入中记录的到达站点。"""
+    output = from_json_text(block.output_params, {})
+    if output.get("currentSite"):
+        return str(output["currentSite"])
+    values = from_json_text(block.block_input_params_value, {})
+    return values.get("to")
+
+
 async def _release_task_sites(db: AsyncSession, task: WindTaskRecord, success: bool) -> None:
     """
     根据任务起点和终点释放站点预占状态，并在成功时更新站点装载状态。
     """
     # 成功时释放占用并落终点状态，失败时只回收预占资源。
     params = from_json_text(task.input_params, {})
-    from_site = await db.scalar(select(WorkSite).where(WorkSite.site_id == params.get("from")))
-    to_site = await db.scalar(select(WorkSite).where(WorkSite.site_id == params.get("to")))
-    if from_site:
-        from_site.preparing = 0
-        from_site.agv_id = None
-        from_site.holder = 0
-        if success:
-            from_site.filled = 0
-    if to_site:
-        to_site.preparing = 0
-        to_site.agv_id = None
-        to_site.holder = 0
-        if success:
-            to_site.filled = 1
+    path = from_json_text(task.path, {})
+    route = path.get("route") or [params.get("from"), params.get("to")]
+    site_ids = {site_id for site_id in route if site_id}
+    sites = (await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))).all()
+    first_site = route[0] if route else None
+    last_site = route[-1] if route else None
+    for site in sites:
+        if site.agv_id not in {None, task.agv_id}:
+            continue
+        site.preparing = 0
+        site.agv_id = None
+        site.holder = 0
+        if success and site.site_id == first_site:
+            site.filled = 0
+        if success and site.site_id == last_site:
+            site.filled = 1
 
 
 def _target_site(task: WindTaskRecord) -> str | None:

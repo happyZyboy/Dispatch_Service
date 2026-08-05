@@ -9,7 +9,7 @@ _client: Redis | None = None
 
 
 def get_redis() -> Redis:
-    """Return the process-local async Redis client."""
+    """返回当前进程复用的异步 Redis 客户端。"""
     global _client
     if _client is None:
         _client = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -17,7 +17,7 @@ def get_redis() -> Redis:
 
 
 async def close_redis() -> None:
-    """Close the process-local Redis connection pool."""
+    """关闭当前进程复用的 Redis 连接池。"""
     global _client
     if _client is None:
         return

@@ -1,1 +1,1 @@
-"""Application-level background jobs."""
+"""应用级后台任务。"""

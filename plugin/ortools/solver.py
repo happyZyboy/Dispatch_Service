@@ -24,6 +24,7 @@ class OrtoolsSolver:
                 robot.get("del_", robot.get("del", 0)) == 0
                 and robot.get("enable_status", 0) == 1
                 and robot.get("dispatch_status") == DispatchStatus.IDLE
+                and robot.get("has_unresolved_alarm", 0) == 0
                 and float(robot.get("battery_level") or 0)
                 >= float(robot.get("battery_threshold") or 0)
                 and bool(robot.get("current_site_id") or robot.get("current_location"))

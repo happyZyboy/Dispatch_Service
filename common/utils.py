@@ -71,44 +71,67 @@ def ensure_list(value: Any) -> list[Any]:
 
 
 def normalize_site_path(site_path: Iterable[str]) -> list[str]:
-    """Normalize an ordered WMS site list without changing its execution order."""
+    """规范化一个有序的 WMS 库位列表，但不改变其执行顺序."""
     return [str(site).strip() for site in site_path if site is not None and str(site).strip()]
 
 
 def build_route(
-    site_path: Iterable[str] | str,
+    site_path: Iterable[str],
     start_site: str | None = None,
-    via_sites: Iterable[str] | None = None,
+    map_data: Any | None = None,
 ) -> dict[str, Any]:
     """
-    Build an executable route from WMS target sites and the selected robot position.
+    根据 WMS 的有序目标库位列表和机器人当前位置生成可执行路径。
 
-    ``build_route("A", "B", ["C"])`` remains supported for old callers. New callers
-    should pass ``build_route(["B", "C"], start_site="A")``.
+    提交任务时还没有选定机器人，只有目标库位，因此此时不传 start_site；
+    调度选车后再传入机器人当前所在库位，生成完整路线和分段信息。
     """
-    if isinstance(site_path, str):
-        if start_site is None:
-            raise ValueError("legacy route building requires a destination site")
-        requested_route = normalize_site_path([*(via_sites or []), start_site])
-        resolved_start = site_path.strip()
-    else:
-        requested_route = normalize_site_path(site_path)
-        resolved_start = start_site.strip() if start_site else None
+    requested_route = normalize_site_path(site_path)
+    resolved_start = start_site.strip() if start_site else None
 
-    route = ([resolved_start] if resolved_start else []) + requested_route
+    if not resolved_start:
+        return {
+            "sitePath": requested_route,
+            "route": requested_route,
+            "segments": [],
+        }
+
+    waypoints = [resolved_start, *requested_route]
+    route: list[str] = []
     segments = []
-    if resolved_start:
-        for index in range(len(route) - 1):
+    for leg_from, leg_to in zip(waypoints, waypoints[1:]):
+        leg_route = plan_map_segment(leg_from, leg_to, map_data)
+        if not leg_route:
+            continue
+        if not route:
+            route.extend(leg_route)
+        elif route[-1] == leg_route[0]:
+            route.extend(leg_route[1:])
+        else:
+            route.extend(leg_route)
+        for index in range(len(leg_route) - 1):
             segments.append(
                 {
-                    "stepIndex": index + 1,
-                    "from": route[index],
-                    "to": route[index + 1],
+                    "stepIndex": len(segments) + 1,
+                    "from": leg_route[index],
+                    "to": leg_route[index + 1],
                 }
             )
 
     return {
-        "requestedRoute": requested_route,
+        "sitePath": requested_route,
         "route": route,
         "segments": segments,
     }
+
+
+def plan_map_segment(
+    from_site: str,
+    to_site: str,
+    map_data: Any | None = None,
+) -> list[str]:
+    """规划两个目标点之间的地图路径；地图数据接入前暂时按直连处理。"""
+    del map_data
+    if from_site == to_site:
+        return [from_site]
+    return [from_site, to_site]

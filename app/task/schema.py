@@ -2,17 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskSubmitRequest(BaseModel):
     # WMS 只提交按执行顺序排列的目标库位，实际起点由调度阶段选车后补出。
     templateLabel: str | None = None  # 任务模板业务编码，不传时使用默认模板
-    sitePath: list[str] = Field(
-        ...,
-        min_length=1,
-        validation_alias=AliasChoices("sitePath", "siteList", "path"),
-    )  # WMS 按顺序提交的目标库位列表
+    sitePath: list[str] = Field(..., min_length=1)  # WMS 按顺序提交的目标库位列表
     priority: int = Field(default=5, ge=1, le=10)  # 任务优先级，范围 1-10，默认 5
     agvId: str | None = None  # 指定执行任务的机器人编码，为空则由系统调度分配
     outOrderNo: str | None = None  # 外部系统订单号，用于业务侧关联追踪

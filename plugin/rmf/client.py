@@ -12,10 +12,11 @@ class RmfClient:
         """
         向 RMF 模拟提交流程块任务，并返回提交结果。
         """
-        logger.info("rmf submit_block: %s", payload)
+        logger.info("RMF 提交流程块任务：%s", payload)
+        root_id = payload.get("rootBlockId") or payload.get("rootStepIndex") or "root"
         return {
             "success": True,
-            "rmfTaskId": f"rmf-{payload.get('taskId')}",
+            "rmfTaskId": f"rmf-{payload.get('taskId')}-{root_id}",
             "payload": payload,
         }
 
@@ -23,19 +24,19 @@ class RmfClient:
         """
         向 RMF 模拟上报流程块进度，并返回上报结果。
         """
-        logger.info("rmf report_progress: %s", payload)
+        logger.info("RMF 上报流程块进度：%s", payload)
         return {"success": True, "payload": payload}
 
     def report_complete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
         向 RMF 模拟上报流程块完成事件，并返回上报结果。
         """
-        logger.info("rmf report_complete: %s", payload)
+        logger.info("RMF 上报流程块完成：%s", payload)
         return {"success": True, "payload": payload}
 
     def report_failed(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
         向 RMF 模拟上报流程块失败事件，并返回上报结果。
         """
-        logger.info("rmf report_failed: %s", payload)
+        logger.info("RMF 上报流程块失败：%s", payload)
         return {"success": True, "payload": payload}

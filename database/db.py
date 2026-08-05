@@ -8,7 +8,7 @@ from core.conf import settings
 from database.base import Base
 
 if not settings.database_url.startswith("mysql+asyncmy://"):
-    raise ValueError("DATABASE_URL must use mysql+asyncmy:// for this project")
+    raise ValueError("DATABASE_URL 必须使用 mysql+asyncmy:// 连接格式")
 
 engine = create_async_engine(
     settings.database_url,
