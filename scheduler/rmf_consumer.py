@@ -8,14 +8,20 @@ from typing import Any
 
 from sqlalchemy import select
 
-from app.domain import build_operation_plans, create_operation_blocks, create_task_log, mark_robot_idle
-from app.map.service import run_map_cache_listener
+from app.domain import (
+    build_operation_plans,
+    create_operation_blocks,
+    create_task_log,
+    mark_robot_idle,
+    release_reserved_map_nodes,
+)
+from app.map.service import get_active_map_version, run_map_cache_listener
 from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
 from common.utils import from_json_text, now, to_json_text
 from core.conf import settings
 from database.db import SessionLocal
-from database.models import MapNode, WindBlockRecord, WindTaskRecord
+from database.models import WindBlockRecord, WindTaskRecord
 from plugin.rmf.client import RmfClient
 from scheduler.rabbitmq import close_rabbitmq, get_rabbitmq, publish_rmf_dispatch
 
@@ -128,6 +134,21 @@ class RmfDispatchConsumer:
                 raise StaleDispatchMessage(f"机器人分配已变更：task_id={task_id}")
             if requested_map_version_id and str(task.map_version_id) != requested_map_version_id:
                 raise StaleDispatchMessage(f"地图版本已变更：task_id={task_id}")
+
+            active_map_version = await get_active_map_version(db)
+            if task.map_version_id != active_map_version.id:
+                variables = from_json_text(task.variables, {})
+                task.status = TaskStatus.SUSPENDED
+                task.ended_reason = (
+                    f"任务绑定的地图版本已失效，taskMapVersionId={task.map_version_id}, "
+                    f"activeMapVersionId={active_map_version.id}"
+                )
+                if task.agv_id:
+                    await mark_robot_idle(db, task.agv_id, variables.get("currentSite"))
+                    await release_reserved_map_nodes(db, task, task.agv_id)
+                create_task_log(db, task.id, task.ended_reason, level="ERROR")
+                await db.commit()
+                return None
 
             variables = from_json_text(task.variables, {})
             if variables.get("rmfDispatchKey") != dispatch_key:
@@ -259,30 +280,9 @@ class RmfDispatchConsumer:
                     root.ended_reason = error[:500]
             if task.agv_id:
                 await mark_robot_idle(db, task.agv_id, current_site)
-                await self._release_sites(db, task, task.agv_id)
+                await release_reserved_map_nodes(db, task, task.agv_id)
             create_task_log(db, task.id, task.ended_reason, level="ERROR")
             await db.commit()
-
-    async def _release_sites(self, db: Any, task: WindTaskRecord, agv_id: str) -> None:
-        input_params = from_json_text(task.input_params, {})
-        path = from_json_text(task.path, {})
-        node_codes = set(path.get("route") or input_params.get("sitePath") or []) - {None}
-        if not node_codes:
-            return
-        nodes = (
-            await db.scalars(
-                select(MapNode).where(
-                    MapNode.map_version_id == task.map_version_id,
-                    MapNode.node_code.in_(node_codes),
-                    MapNode.del_ == 0,
-                )
-            )
-        ).all()
-        for node in nodes:
-            if node.agv_id == agv_id:
-                node.preparing = 0
-                node.agv_id = None
-                node.holder = 0
 
     @staticmethod
     def _message_attempt(message: Any) -> int:

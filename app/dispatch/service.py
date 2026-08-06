@@ -9,12 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain import build_operation_plans, create_task_log, mark_robot_busy, task_requested_sites
 from app.map.graph import MapGraph
-from app.map.service import get_map_graph
+from app.map.service import get_active_map_version, get_map_graph
 from common.enums.block_status import BlockStatus
+from common.enums.robot_status import RobotStatus
 from common.enums.task_status import TaskStatus
 from common.exception.base import (
     MapNodeNotFoundError,
     MapRouteNotFoundError,
+    MapVersionUnavailableError,
     ResourceUnavailableError,
     StatusNotAllowedError,
     TaskNotFoundError,
@@ -31,7 +33,18 @@ solver = OrtoolsSolver()
 
 
 async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | None, force: bool) -> dict:
-    """为任务分配机器人、持久化分配结果，并写入 RMF 调度队列。"""
+    """
+    为任务选择机器人、基于绑定地图版本规划路径、预占资源并投递 RMF 调度消息。
+
+    方法会先校验任务状态和地图版本，再根据任务是否已经分配机器人决定复用原分配结果，
+    或重新执行选车、路径规划、流程块准备和 RabbitMQ 投递。
+
+    :param db: 当前使用的异步数据库会话。
+    :param task_id: 指定调度的任务主键；为空时自动选择待调度任务。
+    :param agv_id: 指定使用的机器人编码；为空时由调度器自动选择机器人。
+    :param force: 是否强制跳过部分任务状态校验。
+    :return: 任务分配、地图版本、流程块数量和消息投递状态。
+    """
     task = await _pick_task(db, task_id)
     if task.status not in {TaskStatus.PENDING_ASSIGN, TaskStatus.ASSIGNED, TaskStatus.SUSPENDED} and not force:
         raise StatusNotAllowedError("当前任务状态不允许调度")
@@ -40,13 +53,13 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
     reuse_assignment = task.status == TaskStatus.ASSIGNED and bool(task.agv_id) and not force
     requested_sites = task_requested_sites(task)
     if not requested_sites:
-        raise ResourceUnavailableError("任务没有可执行的目标地图节点")
+        raise ResourceUnavailableError("任务中请求路径为空")
 
+    await _ensure_task_map_version_is_active(db, task)
     map_version, map_graph = await get_map_graph(db, task.map_version_id)
     map_graph.require_nodes(requested_sites)
-    task.map_version_id = map_version.id
 
-    if reuse_assignment:
+    if reuse_assignment: #任务机器人已经指定
         selected_uuid = str(task.agv_id)
         root = await _active_root(db, task)
         if root is None:
@@ -150,6 +163,7 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
     task.variables = to_json_text(variables)
 
     # 先持久化任务分配结果，再向 RabbitMQ 投递消息。
+    await _ensure_task_map_version_is_active(db, task)
     await db.commit()
     rabbit_status = await _publish_assignment_message(
         task,
@@ -170,10 +184,46 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
 
 
 def _new_dispatch_key(task_id: int) -> str:
+    """
+    为任务生成一次 RMF 调度投递使用的唯一调度键。
+
+    :param task_id: 任务主键。
+    :return: 由任务 ID 和随机 UUID 组成的调度键。
+    """
     return f"task-{task_id}-{uuid4().hex}"
 
 
+async def _ensure_task_map_version_is_active(db: AsyncSession, task: WindTaskRecord) -> None:
+    """
+    校验任务绑定的地图版本仍然是当前激活版本，避免使用旧地图继续调度。
+
+    :param db: 当前使用的异步数据库会话。
+    :param task: 待校验的任务 ORM 对象。
+    :return: 无返回值；地图版本不可用或已切换时抛出业务异常。
+    """
+    if task.map_version_id is None:
+        raise MapVersionUnavailableError("任务未绑定地图版本，无法继续调度")
+
+    active_version = await get_active_map_version(db)
+    if active_version.id != task.map_version_id:
+        raise MapVersionUnavailableError(
+            f"任务绑定的地图版本已失效，taskMapVersionId={task.map_version_id}, "
+            f"activeMapVersionId={active_version.id}",
+            data={
+                "taskMapVersionId": task.map_version_id,
+                "activeMapVersionId": active_version.id,
+            },
+        )
+
+
 async def _active_root(db: AsyncSession, task: WindTaskRecord) -> WindBlockRecord | None:
+    """
+    查询任务当前处于创建或运行状态的 RootBp 流程块。
+
+    :param db: 当前使用的异步数据库会话。
+    :param task: 要查询流程块的任务 ORM 对象。
+    :return: 当前有效的 RootBp，没有找到时返回 None。
+    """
     root = await db.scalar(
         select(WindBlockRecord)
         .where(
@@ -187,6 +237,12 @@ async def _active_root(db: AsyncSession, task: WindTaskRecord) -> WindBlockRecor
 
 
 def _root_step_index(root: WindBlockRecord | None) -> int:
+    """
+    从 RootBp 的内部变量中读取当前 RootBp 的步骤序号。
+
+    :param root: RootBp 流程块对象，可以为空。
+    :return: 当前 RootBp 步骤序号，没有流程块或没有记录时返回 0。
+    """
     if root is None:
         return 0
     return int(from_json_text(root.internal_variables, {}).get("rootStepIndex") or 0)
@@ -197,6 +253,17 @@ def _candidate_route_costs(
     map_graph: MapGraph,
     target_site: str,
 ) -> dict[str, float | None]:
+    """
+    计算每个候选机器人当前位置到目标节点的最小地图路径代价。
+
+    无当前位置、当前位置不在地图中或不存在可行路径的机器人会记录为 None，
+    调度器会据此过滤不可用机器人。
+
+    :param candidates: 候选机器人状态字典列表。
+    :param map_graph: 任务绑定地图版本对应的内存地图图对象。
+    :param target_site: 任务第一个目标地图节点编码。
+    :return: 机器人编码到路径代价的映射，无法规划时对应值为 None。
+    """
     costs: dict[str, float | None] = {}
     for robot in candidates:
         uuid = str(robot.get("uuid") or "")
@@ -215,6 +282,13 @@ def _robot_start_site(
     robot: dict,
     map_graph: MapGraph,
 ) -> str:
+    """
+    获取并校验机器人当前所在的地图节点。
+
+    :param robot: 包含机器人当前状态的字典。
+    :param map_graph: 任务绑定地图版本对应的内存地图图对象。
+    :return: 机器人当前所在的地图节点编码。
+    """
     current_site = str(robot.get("current_site_id") or "").strip()
     if not current_site:
         raise ResourceUnavailableError(
@@ -228,6 +302,13 @@ def _robot_start_site(
 
 
 def _apply_resolved_route(task: WindTaskRecord, route: dict) -> None:
+    """
+    将包含机器人实际起点的完整路径写回任务输入参数和路径快照。
+
+    :param task: 要更新的任务 ORM 对象。
+    :param route: 路径规划结果，至少包含 route、sitePath 和 segments 字段。
+    :return: 无返回值。
+    """
     resolved_route = route.get("route", [])
     if not resolved_route:
         raise ResourceUnavailableError("无法生成机器人实际起点")
@@ -241,7 +322,13 @@ def _apply_resolved_route(task: WindTaskRecord, route: dict) -> None:
 
 
 def _root_segments(task: WindTaskRecord, root: WindBlockRecord) -> list[dict]:
-    """从完整地图路径中截取当前 RootBp 对应的一段连续路线。"""
+    """
+    从任务保存的完整地图路径中截取当前 RootBp 对应的一段连续路线。
+
+    :param task: 保存完整路径信息的任务 ORM 对象。
+    :param root: 当前需要下发的 RootBp 流程块。
+    :return: 当前 RootBp 对应的连续路径边列表。
+    """
     root_values = from_json_text(root.block_input_params_value, {})
     from_site = root_values.get("from")
     to_site = root_values.get("to")
@@ -277,7 +364,15 @@ def _prepare_first_root(
     start_site: str,
     requested_sites: list[str],
 ) -> int | None:
-    """补齐第一个 RootBp，并跳过机器人已经到达的连续目标点。"""
+    """
+    补齐第一个 RootBp，并跳过机器人已经到达的连续目标点。
+
+    :param root: 提交任务阶段创建的第一个 RootBp。
+    :param agv_id: 已选中的机器人编码。
+    :param start_site: 机器人当前所在的地图节点编码。
+    :param requested_sites: 任务按顺序提交的目标节点列表。
+    :return: 第一个尚未到达的目标节点下标；全部到达时返回 None。
+    """
     if not root:
         raise ResourceUnavailableError("任务缺少第一个 RootBp")
     root_variables = from_json_text(root.internal_variables, {})
@@ -298,6 +393,16 @@ def _hydrate_first_root(
     to_site: str,
     target_index: int,
 ) -> None:
+    """
+    把机器人、起点、终点和目标下标写入第一个 RootBp。
+
+    :param root: 要补充信息的 RootBp 流程块。
+    :param agv_id: 已选中的机器人编码。
+    :param from_site: 当前 RootBp 的起点节点编码。
+    :param to_site: 当前 RootBp 的终点节点编码。
+    :param target_index: 终点在任务目标节点列表中的下标。
+    :return: 无返回值。
+    """
     if not root:
         raise ResourceUnavailableError("任务缺少第一个 RootBp")
     root_values = from_json_text(root.block_input_params_value, {})
@@ -319,6 +424,17 @@ async def _publish_assignment_message(
     dispatch_key: str,
     root_block_id: str,
 ) -> str:
+    """
+    组装并发布任务分配消息到 RabbitMQ，供 RMF 消费者继续下发。
+
+    :param task: 已完成机器人分配和路径规划的任务 ORM 对象。
+    :param agv_id: 已选中的机器人编码。
+    :param operation_plans: 当前 RootBp 拆分出的动作子步骤。
+    :param planned_segments: 当前 RootBp 对应的地图路径边列表。
+    :param dispatch_key: 本次调度投递的唯一调度键。
+    :param root_block_id: 当前 RootBp 的流程块编码。
+    :return: RabbitMQ 投递状态，成功时为 PUBLISHED，失败时为 PENDING_RABBITMQ。
+    """
     payload = {
         "event": "task.assigned",
         "taskId": str(task.id),
@@ -344,11 +460,13 @@ async def _publish_assignment_message(
 
 async def _pick_task(db: AsyncSession, task_id: int | None) -> WindTaskRecord:
     """
-    查询一个待调度的任务，并加行锁防止并发冲突。
-    如果指定 task_id，则尝试锁定该任务；否则按优先级和时间顺序自动选取。
-    :param db:
-    :param task_id:
-    :return:
+    查询一个待调度的任务，并加行锁防止并发调度冲突。
+
+    指定 task_id 时锁定指定任务；未指定时按优先级倒序和创建时间正序自动选取任务。
+
+    :param db: 当前使用的异步数据库会话。
+    :param task_id: 指定任务主键；为空时自动选择待分配任务。
+    :return: 被选中的任务 ORM 对象。
     """
     if task_id is not None:
         task = await db.scalar(
@@ -369,13 +487,25 @@ async def _pick_task(db: AsyncSession, task_id: int | None) -> WindTaskRecord:
 
 
 async def _robot_candidates(db: AsyncSession) -> list[dict]:
+    """
+    查询满足基础在线条件的机器人，并合并机器人档案和实时状态。
+
+    只有存在实时状态且最近心跳未超时的机器人会进入候选列表。
+
+    :param db: 当前使用的异步数据库会话。
+    :return: 可参与本次调度的机器人状态字典列表。
+    """
     robots = (await db.scalars(select(RobotItem).where(RobotItem.del_ == 0))).all()
-    states = {row.uuid: row for row in (await db.scalars(select(RobotCurrentState))).all()}
+    states: dict[str, RobotCurrentState] = {
+        row.uuid: row
+        for row in (await db.scalars(select(RobotCurrentState))).all()
+    }
+
     heartbeat_cutoff = now() - timedelta(seconds=settings.robot_heartbeat_timeout_seconds)
     payload = []
     for robot in robots:
         state = states.get(robot.uuid)
-        if not state or state.last_heartbeat_at is None or state.last_heartbeat_at < heartbeat_cutoff:
+        if not state or state.last_heartbeat_at is None or state.last_heartbeat_at < heartbeat_cutoff or state.current_status != RobotStatus.IDLE:
             continue
         merged = robot.to_dict()
         merged.update(state.to_dict())
@@ -384,6 +514,15 @@ async def _robot_candidates(db: AsyncSession) -> list[dict]:
 
 
 async def _reserve_sites(db: AsyncSession, task: WindTaskRecord, agv_id: str, route: list[str]) -> None:
+    """
+    预占任务完整路径上的地图节点，标记节点正在被任务预留。
+
+    :param db: 当前使用的异步数据库会话。
+    :param task: 当前调度任务 ORM 对象，用于确定地图版本。
+    :param agv_id: 执行任务的机器人编码。
+    :param route: 机器人从起点到任务目标的完整节点路径。
+    :return: 无返回值；修改结果会随当前数据库事务提交。
+    """
     node_codes = {node_code for node_code in route if node_code}
     if not node_codes:
         return

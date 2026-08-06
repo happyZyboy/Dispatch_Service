@@ -11,7 +11,7 @@ from common.enums.log_level import LogLevel
 from common.enums.robot_status import RobotStatus
 from common.enums.task_status import TaskStatus
 from common.utils import format_dt, from_json_text, normalize_site_path, now, to_json_text
-from database.models import AlarmRecord, RobotCurrentState, RobotStatusRecord, WindBlockRecord, WindTaskLog, WindTaskRecord
+from database.models import AlarmRecord, MapNode, RobotCurrentState, RobotStatusRecord, WindBlockRecord, WindTaskLog, WindTaskRecord
 
 TASK_STATUS_DESC = {
     TaskStatus.CREATED: "待创建",
@@ -352,6 +352,38 @@ async def mark_robot_idle(session: AsyncSession, uuid: str, current_site_id: str
             location=state.current_location or current_site_id,
         )
     )
+
+
+async def release_reserved_map_nodes(
+    session: AsyncSession,
+    task: WindTaskRecord,
+    agv_id: str | None = None,
+) -> None:
+    """
+    释放任务在其绑定地图版本中预占的地图节点，避免异常结束后资源一直被占用。
+    """
+    input_params = from_json_text(task.input_params, {})
+    path = from_json_text(task.path, {})
+    node_codes = set(path.get("route") or input_params.get("sitePath") or []) - {None}
+    if task.map_version_id is None or not node_codes:
+        return
+
+    owner_agv_id = agv_id or task.agv_id
+    nodes = (
+        await session.scalars(
+            select(MapNode).where(
+                MapNode.map_version_id == task.map_version_id,
+                MapNode.node_code.in_(node_codes),
+                MapNode.del_ == 0,
+            )
+        )
+    ).all()
+    for node in nodes:
+        if node.agv_id not in {None, owner_agv_id}:
+            continue
+        node.preparing = 0
+        node.agv_id = None
+        node.holder = 0
 
 
 async def refresh_alarm_snapshot(session: AsyncSession, vehicle_id: str) -> None:

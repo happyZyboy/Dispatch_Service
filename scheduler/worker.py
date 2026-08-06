@@ -9,10 +9,10 @@ from redis.exceptions import RedisError as RedisClientError
 from sqlalchemy import select
 
 from app.dispatch.service import trigger_dispatch
-from app.domain import create_task_log
+from app.domain import create_task_log, mark_robot_idle, release_reserved_map_nodes
 from app.map.service import run_map_cache_listener
 from common.enums.task_status import TaskStatus
-from common.exception.base import StatusNotAllowedError, TaskNotFoundError
+from common.exception.base import MapVersionUnavailableError, StatusNotAllowedError, TaskNotFoundError
 from common.utils import from_json_text
 from core.conf import settings
 from database.db import SessionLocal
@@ -77,6 +77,12 @@ class SchedulerWorker:
                 result = await trigger_dispatch(db, claim.task_id, None, False)
         except asyncio.CancelledError:
             raise
+        except MapVersionUnavailableError as exc:
+            # 地图版本冲突不是临时网络错误，直接挂起任务，避免 Worker 反复重试旧地图。
+            logger.error("任务地图版本已变化，停止调度：task_id=%s, error=%s", claim.task_id, exc)
+            await self._suspend_task(claim.task_id, str(exc))
+            await self.queue.ack(claim.task_id)
+            return
         except (TaskNotFoundError, StatusNotAllowedError):
             logger.info("任务无需继续调度，直接确认：task_id=%s", claim.task_id)
             await self.queue.ack(claim.task_id)
@@ -101,6 +107,21 @@ class SchedulerWorker:
             result.get("agvId"),
             result.get("status"),
         )
+
+    async def _suspend_task(self, task_id: int, reason: str) -> None:
+        async with SessionLocal() as db:
+            task = await db.scalar(select(WindTaskRecord).where(WindTaskRecord.id == task_id).with_for_update())
+            if not task:
+                return
+            if task.status in {TaskStatus.PENDING_ASSIGN, TaskStatus.ASSIGNED, TaskStatus.SUSPENDED}:
+                variables = from_json_text(task.variables, {})
+                if task.agv_id:
+                    await mark_robot_idle(db, task.agv_id, variables.get("currentSite"))
+                    await release_reserved_map_nodes(db, task, task.agv_id)
+                task.status = TaskStatus.SUSPENDED
+                task.ended_reason = reason[:500]
+                create_task_log(db, task.id, task.ended_reason, level="ERROR")
+                await db.commit()
 
     async def _suspend_after_retries(self, task_id: int, error: str) -> None:
         async with SessionLocal() as db:

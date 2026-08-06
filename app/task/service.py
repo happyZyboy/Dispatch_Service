@@ -6,13 +6,14 @@ from redis.exceptions import RedisError as RedisClientError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import create_initial_block_plan, create_task_log, mark_robot_idle, serialize_task
+from app.domain import create_initial_block_plan, create_task_log, mark_robot_idle, release_reserved_map_nodes, serialize_task
 from app.dispatch.service import trigger_dispatch
+from app.map.service import get_map_graph
 from common.enums.task_status import TaskStatus
 from common.exception.base import RequestParamError, ResourceUnavailableError, RobotNotFoundError, StatusNotAllowedError, TaskNotFoundError, TemplateNotFoundError
 from common.utils import build_route, from_json_text, normalize_site_path, now, paginate, to_json_text
 from core.conf import settings
-from database.models import MapNode, RobotItem, WindBlockRecord, WindTaskDef, WindTaskLog, WindTaskRecord
+from database.models import RobotItem, WindBlockRecord, WindTaskDef, WindTaskLog, WindTaskRecord
 from database.redis import get_redis
 from scheduler.queue import TaskQueue
 
@@ -42,10 +43,12 @@ async def submit_task(
         await _get_robot(db, agv_id)
 
     # 保存请求路径，但不提前生成最终 segments；机器人起点要等调度选车后才能确定。
+    map_version, map_graph = await get_map_graph(db)
+    map_graph.require_nodes(requested_sites)
     route = build_route(requested_sites)
     variables = {
         "currentStepIndex": 0,
-        "totalSteps": 0,
+        "totalSteps": len(requested_sites),
         "currentSite": None,
         "nextSite": requested_sites[0],
         "selectedAgvId": agv_id or "",
@@ -67,6 +70,7 @@ async def submit_task(
         def_label=task_def.label,
         def_version=task_def.version,
         status=TaskStatus.PENDING_ASSIGN,
+        map_version_id=map_version.id,
         input_params=to_json_text(input_params),
         path=to_json_text(route),
         variables=to_json_text(variables),
@@ -107,7 +111,7 @@ async def submit_task(
         "fromSite": None,
         "toSite": requested_sites[-1],
         "sitePath": requested_sites,
-        "mapVersionId": None,
+        "mapVersionId": str(task.map_version_id),
         "agvId": agv_id,
         "outOrderNo": out_order_no,
         "priority": priority,
@@ -180,7 +184,7 @@ async def cancel_task(db: AsyncSession, task_id: int, reason: str | None) -> dic
     create_task_log(db, task.id, f"任务已取消：{task.ended_reason}")
     if task.agv_id:
         await mark_robot_idle(db, task.agv_id, _task_target_site(task))
-        await _release_reserved_sites(db, task)
+        await release_reserved_map_nodes(db, task)
     await db.commit()
     await _remove_from_queue(task.id)
     return {"taskId": str(task.id), "status": task.status, "endedOn": task.to_dict()["ended_on"]}
@@ -194,6 +198,10 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
     source = await _get_task(db, task_id)
     if source.status not in {TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.SUSPENDED}:
         raise StatusNotAllowedError("当前任务状态不允许重试")
+    retry_sites = normalize_site_path(from_json_text(source.input_params, {}).get("sitePath") or [])
+    retry_map_version, retry_map_graph = await get_map_graph(db)
+    retry_map_graph.require_nodes(retry_sites)
+
     cloned = WindTaskRecord(
         def_id=source.def_id,
         def_label=source.def_label,
@@ -201,7 +209,7 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
         status=TaskStatus.PENDING_ASSIGN,
         input_params=source.input_params,
         path=source.path,
-        map_version_id=None,
+        map_version_id=retry_map_version.id,
         variables=source.variables,
         task_def_detail=source.task_def_detail,
         agv_id=None,
@@ -284,27 +292,3 @@ def _task_target_site(task: WindTaskRecord) -> str | None:
     """
     payload = from_json_text(task.input_params, {})
     return payload.get("to")
-
-
-async def _release_reserved_sites(db: AsyncSession, task: WindTaskRecord) -> None:
-    """释放按任务路径预留的所有地图节点。"""
-    params = from_json_text(task.input_params, {})
-    path = from_json_text(task.path, {})
-    node_codes = set(path.get("route") or params.get("sitePath") or []) - {None}
-    if not node_codes:
-        return
-    nodes = (
-        await db.scalars(
-            select(MapNode).where(
-                MapNode.map_version_id == task.map_version_id,
-                MapNode.node_code.in_(node_codes),
-                MapNode.del_ == 0,
-            )
-        )
-    ).all()
-    for node in nodes:
-        if node.agv_id not in {None, task.agv_id}:
-            continue
-        node.preparing = 0
-        node.agv_id = None
-        node.holder = 0
