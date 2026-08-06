@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from background.robot_monitor import run_robot_heartbeat_monitor
+from app.map.service import run_map_cache_listener
 from common.exception.handler import register_exception_handlers
 from core.conf import settings
 from core.logger import configure_logging
@@ -30,13 +31,22 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         run_robot_heartbeat_monitor(stop_event),
         name="robot-heartbeat-monitor",
     )
+    map_cache_task = asyncio.create_task(
+        run_map_cache_listener(stop_event),
+        name="map-cache-listener",
+    )
     try:
         yield
     finally:
         stop_event.set()
         monitor_task.cancel()
+        map_cache_task.cancel()
         try:
             await monitor_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await map_cache_task
         except asyncio.CancelledError:
             pass
         await close_redis()

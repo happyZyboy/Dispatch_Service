@@ -92,6 +92,7 @@ def serialize_task(
         "fromSite": input_params.get("from"),
         "toSite": input_params.get("to"),
         "sitePath": input_params.get("sitePath") or [],
+        "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
         "agvId": task.agv_id,
         "priority": task.priority,
         "outOrderNo": task.out_order_no,
@@ -108,7 +109,10 @@ def serialize_task(
 
 
 def task_requested_sites(task: WindTaskRecord) -> list[str]:
-    """从任务快照中读取按顺序排列的 WMS 目标库位。"""
+    """从任务快照中读取按顺序排列的 WMS 目标地图节点。
+
+    :param task: WindTaskRecord
+    """
     params = from_json_text(task.input_params, {})
     return normalize_site_path(params.get("sitePath") or [])
 
@@ -117,7 +121,7 @@ async def create_initial_block_plan(session: AsyncSession, task: WindTaskRecord)
     """
     在任务提交阶段创建选车流程块和第一个占位 RootBp。
 
-    第一个 RootBp 只有在选定机器人后才能确定 ``from`` 站点，因此提交阶段先留空，
+    第一个 RootBp 只有在选定机器人后才能确定 ``from`` 地图节点，因此提交阶段先留空，
     后续由调度服务补全。
     """
     existing = (
@@ -264,7 +268,21 @@ async def create_next_root_block(
     requested_sites = task_requested_sites(task)
     if target_index >= len(requested_sites):
         return []
-    root_step_index = target_index + 1
+    existing_roots = (
+        await session.scalars(
+            select(WindBlockRecord).where(
+                WindBlockRecord.task_record_id == task.id,
+                WindBlockRecord.block_name == "RootBp",
+            )
+        )
+    ).all()
+    root_step_index = max(
+        [
+            int(from_json_text(root.internal_variables, {}).get("rootStepIndex") or 0)
+            for root in existing_roots
+        ],
+        default=0,
+    ) + 1
     root_block_id = f"{task.id}-root-{root_step_index}"
     existing = await session.scalar(
         select(WindBlockRecord).where(
@@ -365,13 +383,24 @@ async def update_task_progress(session: AsyncSession, task: WindTaskRecord) -> N
             .order_by(WindBlockRecord.id.asc())
         )
     ).all()
-    completed = sum(1 for root in roots if root.status == BlockStatus.SUCCESS)
+    completed_roots = [root for root in roots if root.status == BlockStatus.SUCCESS]
+    completed = len(completed_roots)
     requested_sites = task_requested_sites(task)
     variables = from_json_text(task.variables, {})
     variables["currentStepIndex"] = completed
     variables["totalSteps"] = len(requested_sites)
-    if completed > 0 and completed <= len(requested_sites):
-        variables["currentSite"] = requested_sites[completed - 1]
-    if completed < len(requested_sites):
-        variables["nextSite"] = requested_sites[completed]
+    if completed_roots:
+        last_root = completed_roots[-1]
+        last_root_values = from_json_text(last_root.output_params, {})
+        last_root_variables = from_json_text(last_root.internal_variables, {})
+        last_target_index = int(last_root_variables.get("targetIndex") or 0)
+        variables["currentStepIndex"] = min(last_target_index + 1, len(requested_sites))
+        variables["currentSite"] = (
+            last_root_values.get("currentSite")
+            or requested_sites[min(last_target_index, len(requested_sites) - 1)]
+        )
+        next_index = last_target_index + 1
+        variables["nextSite"] = requested_sites[next_index] if next_index < len(requested_sites) else None
+    elif requested_sites:
+        variables["nextSite"] = requested_sites[0]
     task.variables = to_json_text(variables)

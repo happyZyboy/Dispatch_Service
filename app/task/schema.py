@@ -6,9 +6,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TaskSubmitRequest(BaseModel):
-    # WMS 只提交按执行顺序排列的目标库位，实际起点由调度阶段选车后补出。
+    # WMS 只提交按执行顺序排列的目标地图节点，实际起点由调度阶段选车后补出。
     templateLabel: str | None = None  # 任务模板业务编码，不传时使用默认模板
-    sitePath: list[str] = Field(..., min_length=1)  # WMS 按顺序提交的目标库位列表
+    sitePath: list[str] = Field(..., min_length=1)  # WMS 按顺序提交的目标地图节点列表
     priority: int = Field(default=5, ge=1, le=10)  # 任务优先级，范围 1-10，默认 5
     agvId: str | None = None  # 指定执行任务的机器人编码，为空则由系统调度分配
     outOrderNo: str | None = None  # 外部系统订单号，用于业务侧关联追踪
@@ -34,8 +34,8 @@ class TaskListQuery(BaseModel):
     pageSize: int = Field(default=20, ge=1, le=100)  # 每页数量，范围 1-100，默认 20
     status: int | None = None  # 任务状态筛选
     agvId: str | None = None  # 按执行机器人编码筛选
-    fromSite: str | None = None  # 按起点站点筛选
-    toSite: str | None = None  # 按终点站点筛选
+    fromSite: str | None = None  # 按起点地图节点筛选
+    toSite: str | None = None  # 按终点地图节点筛选
     keyword: str | None = None  # 关键字筛选，匹配任务 ID 或外部订单号
 
 

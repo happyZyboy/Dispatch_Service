@@ -8,7 +8,7 @@ from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
 from common.exception.base import InvalidRmfCallbackError, TaskNotFoundError
 from common.utils import from_json_text, now, to_json_text
-from database.models import WindBlockRecord, WindTaskRecord, WorkSite
+from database.models import MapNode, WindBlockRecord, WindTaskRecord
 from plugin.rmf.client import RmfClient
 
 
@@ -153,7 +153,7 @@ async def handle_block_failed(db: AsyncSession, payload) -> dict:
     """
     处理流程块失败回调，更新失败信息并释放相关业务资源。
     """
-    # 失败回调要同步收口任务、机器人和站点占用状态。
+    # 失败回调要同步收口任务、机器人和地图节点占用状态。
     task = await _get_task(db, payload.taskRecordId)
     block = await _locate_block(db, payload)
     block.status = BlockStatus.FAILED
@@ -207,7 +207,7 @@ async def _get_parent_root(db: AsyncSession, block: WindBlockRecord) -> WindBloc
 
 
 def _block_to_site(block: WindBlockRecord) -> str | None:
-    """提取 RMF 回调或动作流程块输入中记录的到达站点。"""
+    """提取 RMF 回调或动作流程块输入中记录的到达地图节点。"""
     output = from_json_text(block.output_params, {})
     if output.get("currentSite"):
         return str(output["currentSite"])
@@ -217,31 +217,39 @@ def _block_to_site(block: WindBlockRecord) -> str | None:
 
 async def _release_task_sites(db: AsyncSession, task: WindTaskRecord, success: bool) -> None:
     """
-    根据任务起点和终点释放站点预占状态，并在成功时更新站点装载状态。
+    根据任务起点和终点释放地图节点预占状态，并在成功时更新节点装载状态。
     """
     # 成功时释放占用并落终点状态，失败时只回收预占资源。
     params = from_json_text(task.input_params, {})
     path = from_json_text(task.path, {})
     route = path.get("route") or [params.get("from"), params.get("to")]
-    site_ids = {site_id for site_id in route if site_id}
-    sites = (await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))).all()
+    node_codes = {node_code for node_code in route if node_code}
+    nodes = (
+        await db.scalars(
+            select(MapNode).where(
+                MapNode.map_version_id == task.map_version_id,
+                MapNode.node_code.in_(node_codes),
+                MapNode.del_ == 0,
+            )
+        )
+    ).all()
     first_site = route[0] if route else None
     last_site = route[-1] if route else None
-    for site in sites:
-        if site.agv_id not in {None, task.agv_id}:
+    for node in nodes:
+        if node.agv_id not in {None, task.agv_id}:
             continue
-        site.preparing = 0
-        site.agv_id = None
-        site.holder = 0
-        if success and site.site_id == first_site:
-            site.filled = 0
-        if success and site.site_id == last_site:
-            site.filled = 1
+        node.preparing = 0
+        node.agv_id = None
+        node.holder = 0
+        if success and node.node_code == first_site:
+            node.filled = 0
+        if success and node.node_code == last_site:
+            node.filled = 1
 
 
 def _target_site(task: WindTaskRecord) -> str | None:
     """
-    从任务输入参数中读取任务目标站点。
+    从任务输入参数中读取任务目标地图节点。
     """
     params = from_json_text(task.input_params, {})
     return params.get("to")

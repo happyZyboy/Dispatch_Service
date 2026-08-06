@@ -8,12 +8,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain import build_operation_plans, create_task_log, mark_robot_busy, task_requested_sites
+from app.map.graph import MapGraph
+from app.map.service import get_map_graph
 from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
-from common.exception.base import ResourceUnavailableError, StatusNotAllowedError, TaskNotFoundError
+from common.exception.base import (
+    MapNodeNotFoundError,
+    MapRouteNotFoundError,
+    ResourceUnavailableError,
+    StatusNotAllowedError,
+    TaskNotFoundError,
+)
 from common.utils import build_route, from_json_text, now, to_json_text
 from core.conf import settings
-from database.models import RobotCurrentState, RobotItem, WindBlockRecord, WindTaskRecord, WorkSite
+from database.models import MapNode, RobotCurrentState, RobotItem, WindBlockRecord, WindTaskRecord
 from plugin.ortools.solver import OrtoolsSolver
 from scheduler.rabbitmq import publish_rmf_dispatch
 
@@ -32,7 +40,11 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
     reuse_assignment = task.status == TaskStatus.ASSIGNED and bool(task.agv_id) and not force
     requested_sites = task_requested_sites(task)
     if not requested_sites:
-        raise ResourceUnavailableError("任务没有可执行的目标库位")
+        raise ResourceUnavailableError("任务没有可执行的目标地图节点")
+
+    map_version, map_graph = await get_map_graph(db, task.map_version_id)
+    map_graph.require_nodes(requested_sites)
+    task.map_version_id = map_version.id
 
     if reuse_assignment:
         selected_uuid = str(task.agv_id)
@@ -42,19 +54,23 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
         dispatch_key = variables.get("rmfDispatchKey") or _new_dispatch_key(task.id)
     else:
         candidates = await _robot_candidates(db)
-        site_positions = await _site_positions(db)
+        route_costs = _candidate_route_costs(candidates, map_graph, requested_sites[0])
         selected = solver.choose_robot(
             candidates,
             agv_id or task.agv_id,
             target_site=requested_sites[0],
-            site_positions=site_positions,
+            route_costs=route_costs,
         )
         if not selected:
             raise ResourceUnavailableError("当前没有可用于调度的机器人")
 
         selected_uuid = selected["uuid"]
-        start_site = _robot_start_site(selected, site_positions)
-        resolved_path = build_route(requested_sites, start_site=start_site)
+        start_site = _robot_start_site(selected, map_graph)
+        resolved_path = build_route(
+            requested_sites,
+            start_site=start_site,
+            map_data=map_graph,
+        )
         _apply_resolved_route(task, resolved_path)
         task.agv_id = selected_uuid
         task.status = TaskStatus.ASSIGNED
@@ -77,7 +93,30 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
             selection_variables["selectedAgvId"] = selected_uuid
             select_block.internal_variables = to_json_text(selection_variables)
 
-        _hydrate_first_root(root, selected_uuid, start_site, requested_sites[0])
+        target_index = _prepare_first_root(root, selected_uuid, start_site, requested_sites)
+        if target_index is None:
+            root.status = BlockStatus.SUCCESS
+            root.started_on = root.started_on or now()
+            root.ended_on = now()
+            root.output_params = to_json_text({"arrived": True, "currentSite": start_site})
+            task.status = TaskStatus.COMPLETED
+            task.ended_on = now()
+            variables["selectedAgvId"] = selected_uuid
+            variables["currentSite"] = start_site
+            variables["nextSite"] = None
+            variables["currentStepIndex"] = len(requested_sites)
+            variables["totalSteps"] = len(requested_sites)
+            task.variables = to_json_text(variables)
+            create_task_log(db, task.id, "机器人已位于全部目标点，任务直接完成")
+            await db.commit()
+            return {
+                "taskId": str(task.id),
+                "status": task.status,
+                "agvId": selected_uuid,
+                "mapVersionId": str(map_version.id),
+                "blockCount": 0,
+                "rabbitStatus": "SKIPPED_ALREADY_AT_TARGET",
+            }
 
         await _reserve_sites(db, task, selected_uuid, resolved_path["route"])
         await mark_robot_busy(db, selected_uuid, task.id, start_site)
@@ -124,6 +163,7 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
         "taskId": str(task.id),
         "status": task.status,
         "agvId": selected_uuid,
+        "mapVersionId": str(task.map_version_id),
         "blockCount": len(operation_plans),
         "rabbitStatus": rabbit_status,
     }
@@ -152,21 +192,39 @@ def _root_step_index(root: WindBlockRecord | None) -> int:
     return int(from_json_text(root.internal_variables, {}).get("rootStepIndex") or 0)
 
 
-async def _site_positions(db: AsyncSession) -> dict[str, tuple[int | float | None, int | float | None]]:
-    sites = (await db.scalars(select(WorkSite).where(WorkSite.del_ == 0))).all()
-    return {site.site_id: (site.row_num, site.column_num) for site in sites}
+def _candidate_route_costs(
+    candidates: list[dict],
+    map_graph: MapGraph,
+    target_site: str,
+) -> dict[str, float | None]:
+    costs: dict[str, float | None] = {}
+    for robot in candidates:
+        uuid = str(robot.get("uuid") or "")
+        current_site = str(robot.get("current_site_id") or "").strip()
+        if not uuid or not current_site or not map_graph.has_node(current_site):
+            costs[uuid] = None
+            continue
+        try:
+            costs[uuid] = map_graph.path_cost(current_site, target_site)
+        except (MapNodeNotFoundError, MapRouteNotFoundError):
+            costs[uuid] = None
+    return costs
 
 
 def _robot_start_site(
     robot: dict,
-    site_positions: dict[str, tuple[int | float | None, int | float | None]],
+    map_graph: MapGraph,
 ) -> str:
-    current_site = robot.get("current_site_id") or robot.get("current_location")
-    if not current_site or current_site not in site_positions:
+    current_site = str(robot.get("current_site_id") or "").strip()
+    if not current_site:
         raise ResourceUnavailableError(
-            f"机器人 {robot.get('uuid')} 没有可用于规划的当前库位"
+            f"机器人 {robot.get('uuid')} 没有可用于规划的当前地图节点"
         )
-    return str(current_site)
+    if not map_graph.has_node(current_site):
+        raise MapNodeNotFoundError(
+            f"机器人当前地图节点不存在: {current_site}"
+        )
+    return current_site
 
 
 def _apply_resolved_route(task: WindTaskRecord, route: dict) -> None:
@@ -208,7 +266,29 @@ def _root_segments(task: WindTaskRecord, root: WindBlockRecord) -> list[dict]:
             break
     if selected and selected[-1].get("to") == to_site:
         return selected
-    return [{"from": from_site, "to": to_site}]
+    raise MapRouteNotFoundError(
+        f"任务保存的地图路径不完整: {from_site} -> {to_site}"
+    )
+
+
+def _prepare_first_root(
+    root: WindBlockRecord,
+    agv_id: str,
+    start_site: str,
+    requested_sites: list[str],
+) -> int | None:
+    """补齐第一个 RootBp，并跳过机器人已经到达的连续目标点。"""
+    if not root:
+        raise ResourceUnavailableError("任务缺少第一个 RootBp")
+    root_variables = from_json_text(root.internal_variables, {})
+    target_index = int(root_variables.get("targetIndex") or 0)
+    while target_index < len(requested_sites) and requested_sites[target_index] == start_site:
+        target_index += 1
+    if target_index >= len(requested_sites):
+        _hydrate_first_root(root, agv_id, start_site, start_site, target_index)
+        return None
+    _hydrate_first_root(root, agv_id, start_site, requested_sites[target_index], target_index)
+    return target_index
 
 
 def _hydrate_first_root(
@@ -216,6 +296,7 @@ def _hydrate_first_root(
     agv_id: str,
     from_site: str,
     to_site: str,
+    target_index: int,
 ) -> None:
     if not root:
         raise ResourceUnavailableError("任务缺少第一个 RootBp")
@@ -224,6 +305,7 @@ def _hydrate_first_root(
     root.block_input_params_value = to_json_text(root_values)
     root_variables = from_json_text(root.internal_variables, {})
     root_variables["selectedAgvId"] = agv_id
+    root_variables["targetIndex"] = target_index
     root_variables.pop("pendingStart", None)
     root.internal_variables = to_json_text(root_variables)
 
@@ -241,9 +323,14 @@ async def _publish_assignment_message(
         "event": "task.assigned",
         "taskId": str(task.id),
         "agvId": agv_id,
+        "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
         "blockCount": len(operation_plans),
         "rootBlockId": root_block_id,
         "dispatchKey": dispatch_key,
+        "root": {
+            "from": planned_segments[0]["from"] if planned_segments else None,
+            "to": planned_segments[-1]["to"] if planned_segments else None,
+        },
         "segments": planned_segments,
         "operations": operation_plans,
     }
@@ -256,9 +343,16 @@ async def _publish_assignment_message(
 
 
 async def _pick_task(db: AsyncSession, task_id: int | None) -> WindTaskRecord:
+    """
+    查询一个待调度的任务，并加行锁防止并发冲突。
+    如果指定 task_id，则尝试锁定该任务；否则按优先级和时间顺序自动选取。
+    :param db:
+    :param task_id:
+    :return:
+    """
     if task_id is not None:
         task = await db.scalar(
-            select(WindTaskRecord).where(WindTaskRecord.id == task_id).with_for_update()
+            select(WindTaskRecord).where(WindTaskRecord.id == task_id).with_for_update()  #with_for_update()查询的时候加个行级锁，锁定该行防止别的事务更改
         )
         if not task:
             raise TaskNotFoundError()
@@ -290,13 +384,19 @@ async def _robot_candidates(db: AsyncSession) -> list[dict]:
 
 
 async def _reserve_sites(db: AsyncSession, task: WindTaskRecord, agv_id: str, route: list[str]) -> None:
-    site_ids = {site_id for site_id in route if site_id}
-    if not site_ids:
+    node_codes = {node_code for node_code in route if node_code}
+    if not node_codes:
         return
-    sites = (
-        await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))
+    nodes = (
+        await db.scalars(
+            select(MapNode).where(
+                MapNode.map_version_id == task.map_version_id,
+                MapNode.node_code.in_(node_codes),
+                MapNode.del_ == 0,
+            )
+        )
     ).all()
-    for site in sites:
-        site.preparing = 1
-        site.agv_id = agv_id
-        site.holder = 3
+    for node in nodes:
+        node.preparing = 1
+        node.agv_id = agv_id
+        node.holder = 3

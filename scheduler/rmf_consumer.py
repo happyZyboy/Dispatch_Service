@@ -9,12 +9,13 @@ from typing import Any
 from sqlalchemy import select
 
 from app.domain import build_operation_plans, create_operation_blocks, create_task_log, mark_robot_idle
+from app.map.service import run_map_cache_listener
 from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
 from common.utils import from_json_text, now, to_json_text
 from core.conf import settings
 from database.db import SessionLocal
-from database.models import WindBlockRecord, WindTaskRecord, WorkSite
+from database.models import MapNode, WindBlockRecord, WindTaskRecord
 from plugin.rmf.client import RmfClient
 from scheduler.rabbitmq import close_rabbitmq, get_rabbitmq, publish_rmf_dispatch
 
@@ -86,6 +87,7 @@ class RmfDispatchConsumer:
             agv_id,
             dispatch_key,
             root_block_id,
+            str(payload.get("mapVersionId") or ""),
             payload.get("operations") or [],
             payload.get("segments") or [],
         )
@@ -108,6 +110,7 @@ class RmfDispatchConsumer:
         agv_id: str,
         dispatch_key: str,
         requested_root_id: str,
+        requested_map_version_id: str,
         planned_operations: list[dict[str, Any]],
         planned_segments: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
@@ -123,6 +126,8 @@ class RmfDispatchConsumer:
                 raise StaleDispatchMessage(f"任务状态不可下发：{task.status}")
             if task.agv_id != agv_id:
                 raise StaleDispatchMessage(f"机器人分配已变更：task_id={task_id}")
+            if requested_map_version_id and str(task.map_version_id) != requested_map_version_id:
+                raise StaleDispatchMessage(f"地图版本已变更：task_id={task_id}")
 
             variables = from_json_text(task.variables, {})
             if variables.get("rmfDispatchKey") != dispatch_key:
@@ -164,6 +169,12 @@ class RmfDispatchConsumer:
                 "agvId": agv_id,
                 "dispatchKey": dispatch_key,
                 "rootBlockId": active_root_id,
+                "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
+                "root": {
+                    "from": planned_segments[0]["from"] if planned_segments else None,
+                    "to": planned_segments[-1]["to"] if planned_segments else None,
+                },
+                "segments": planned_segments,
                 "rootStepIndex": from_json_text(root.internal_variables, {}).get("rootStepIndex"),
                 "blocks": [
                     {
@@ -255,17 +266,23 @@ class RmfDispatchConsumer:
     async def _release_sites(self, db: Any, task: WindTaskRecord, agv_id: str) -> None:
         input_params = from_json_text(task.input_params, {})
         path = from_json_text(task.path, {})
-        site_ids = set(path.get("route") or input_params.get("sitePath") or []) - {None}
-        if not site_ids:
+        node_codes = set(path.get("route") or input_params.get("sitePath") or []) - {None}
+        if not node_codes:
             return
-        sites = (
-            await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))
+        nodes = (
+            await db.scalars(
+                select(MapNode).where(
+                    MapNode.map_version_id == task.map_version_id,
+                    MapNode.node_code.in_(node_codes),
+                    MapNode.del_ == 0,
+                )
+            )
         ).all()
-        for site in sites:
-            if site.agv_id == agv_id:
-                site.preparing = 0
-                site.agv_id = None
-                site.holder = 0
+        for node in nodes:
+            if node.agv_id == agv_id:
+                node.preparing = 0
+                node.agv_id = None
+                node.holder = 0
 
     @staticmethod
     def _message_attempt(message: Any) -> int:
@@ -282,7 +299,18 @@ class RmfDispatchConsumer:
 
 
 async def run_rmf_consumer() -> None:
+    stop_event = asyncio.Event()
+    map_cache_task = asyncio.create_task(
+        run_map_cache_listener(stop_event),
+        name="rmf-consumer-map-cache-listener",
+    )
     try:
         await RmfDispatchConsumer().run()
     finally:
+        stop_event.set()
+        map_cache_task.cancel()
+        try:
+            await map_cache_task
+        except asyncio.CancelledError:
+            pass
         await close_rabbitmq()

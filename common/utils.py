@@ -4,6 +4,8 @@ import json
 from datetime import datetime
 from typing import Any, Iterable
 
+from app.map.graph import MapGraph
+
 
 def now() -> datetime:
     """
@@ -130,8 +132,11 @@ def plan_map_segment(
     to_site: str,
     map_data: Any | None = None,
 ) -> list[str]:
-    """规划两个目标点之间的地图路径；地图数据接入前暂时按直连处理。"""
-    del map_data
+    """使用地图拓扑规划两个节点之间的有向最短路径。"""
     if from_site == to_site:
+        if isinstance(map_data, MapGraph):
+            map_data.require_nodes([from_site])
         return [from_site]
+    if isinstance(map_data, MapGraph):
+        return map_data.shortest_path(from_site, to_site)
     return [from_site, to_site]

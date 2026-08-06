@@ -7,11 +7,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain import create_initial_block_plan, create_task_log, mark_robot_idle, serialize_task
+from app.dispatch.service import trigger_dispatch
 from common.enums.task_status import TaskStatus
-from common.exception.base import ResourceUnavailableError, RobotNotFoundError, SiteNotFoundError, StatusNotAllowedError, TaskNotFoundError, TemplateNotFoundError
+from common.exception.base import RequestParamError, ResourceUnavailableError, RobotNotFoundError, StatusNotAllowedError, TaskNotFoundError, TemplateNotFoundError
 from common.utils import build_route, from_json_text, normalize_site_path, now, paginate, to_json_text
 from core.conf import settings
-from database.models import RobotItem, WindBlockRecord, WindTaskDef, WindTaskLog, WindTaskRecord, WorkSite
+from database.models import MapNode, RobotItem, WindBlockRecord, WindTaskDef, WindTaskLog, WindTaskRecord
 from database.redis import get_redis
 from scheduler.queue import TaskQueue
 
@@ -32,12 +33,10 @@ async def submit_task(
     """
     校验任务所需资源，创建任务快照、路径信息和初始任务日志。
     """
-    # 起点依赖调度阶段选中的机器人当前位置，所以提交时只校验 WMS 目标路径。
+    # 起点和目标节点都由地图提供，提交阶段只保存 WMS 的执行路径参数。
     requested_sites = normalize_site_path(site_path)
     if not requested_sites:
-        raise SiteNotFoundError("WMS 路径不能为空")
-    for site_id in requested_sites:
-        await _get_available_site(db, site_id)
+        raise RequestParamError("WMS sitePath 不能为空")
     task_def = await _get_task_def(db, template_label or settings.default_task_label)
     if agv_id:
         await _get_robot(db, agv_id)
@@ -83,8 +82,6 @@ async def submit_task(
     await db.flush()
     create_task_log(db, task.id, f"任务创建成功，WMS 路径={requested_sites}")
     if agv_id:
-        from app.dispatch.service import trigger_dispatch
-
         dispatch_result = await trigger_dispatch(db, task.id, agv_id, False)
         await db.refresh(task)
         return {
@@ -93,6 +90,7 @@ async def submit_task(
             "fromSite": from_json_text(task.input_params, {}).get("from"),
             "toSite": requested_sites[-1],
             "sitePath": requested_sites,
+            "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
             "agvId": agv_id,
             "outOrderNo": out_order_no,
             "priority": priority,
@@ -109,6 +107,7 @@ async def submit_task(
         "fromSite": None,
         "toSite": requested_sites[-1],
         "sitePath": requested_sites,
+        "mapVersionId": None,
         "agvId": agv_id,
         "outOrderNo": out_order_no,
         "priority": priority,
@@ -177,7 +176,7 @@ async def cancel_task(db: AsyncSession, task_id: int, reason: str | None) -> dic
         raise StatusNotAllowedError("当前任务状态不允许取消")
     task.status = TaskStatus.CANCELLED
     task.ended_on = now()
-    task.ended_reason = reason or "manual cancel"
+    task.ended_reason = reason or "手动取消"
     create_task_log(db, task.id, f"任务已取消：{task.ended_reason}")
     if task.agv_id:
         await mark_robot_idle(db, task.agv_id, _task_target_site(task))
@@ -202,6 +201,7 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
         status=TaskStatus.PENDING_ASSIGN,
         input_params=source.input_params,
         path=source.path,
+        map_version_id=None,
         variables=source.variables,
         task_def_detail=source.task_def_detail,
         agv_id=None,
@@ -266,18 +266,6 @@ async def _get_task_def(db: AsyncSession, label: str) -> WindTaskDef:
     return task_def
 
 
-async def _get_available_site(db: AsyncSession, site_id: str) -> WorkSite:
-    """
-    查询可用站点，并校验站点存在且没有被禁用。
-    """
-    site = await db.scalar(select(WorkSite).where(WorkSite.site_id == site_id, WorkSite.del_ == 0))
-    if not site:
-        raise SiteNotFoundError(f"站点不存在: {site_id}")
-    if site.disabled == 1:
-        raise ResourceUnavailableError(f"站点不可用: {site_id}")
-    return site
-
-
 async def _get_robot(db: AsyncSession, agv_id: str) -> RobotItem:
     """
     查询可参与任务的机器人，并校验机器人存在且处于启用状态。
@@ -292,23 +280,31 @@ async def _get_robot(db: AsyncSession, agv_id: str) -> RobotItem:
 
 def _task_target_site(task: WindTaskRecord) -> str | None:
     """
-    从任务输入参数中提取任务目标站点编号。
+    从任务输入参数中提取任务目标地图节点编码。
     """
     payload = from_json_text(task.input_params, {})
     return payload.get("to")
 
 
 async def _release_reserved_sites(db: AsyncSession, task: WindTaskRecord) -> None:
-    """释放按任务路径预留的所有站点。"""
+    """释放按任务路径预留的所有地图节点。"""
     params = from_json_text(task.input_params, {})
     path = from_json_text(task.path, {})
-    site_ids = set(path.get("route") or params.get("sitePath") or []) - {None}
-    if not site_ids:
+    node_codes = set(path.get("route") or params.get("sitePath") or []) - {None}
+    if not node_codes:
         return
-    sites = (await db.scalars(select(WorkSite).where(WorkSite.site_id.in_(site_ids)))).all()
-    for site in sites:
-        if site.agv_id not in {None, task.agv_id}:
+    nodes = (
+        await db.scalars(
+            select(MapNode).where(
+                MapNode.map_version_id == task.map_version_id,
+                MapNode.node_code.in_(node_codes),
+                MapNode.del_ == 0,
+            )
+        )
+    ).all()
+    for node in nodes:
+        if node.agv_id not in {None, task.agv_id}:
             continue
-        site.preparing = 0
-        site.agv_id = None
-        site.holder = 0
+        node.preparing = 0
+        node.agv_id = None
+        node.holder = 0

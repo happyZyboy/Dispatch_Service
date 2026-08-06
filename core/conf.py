@@ -36,6 +36,9 @@ class Settings:
     rabbitmq_dispatch_lease_seconds: int = int(os.getenv("RABBITMQ_DISPATCH_LEASE_SECONDS", "60"))
     robot_heartbeat_timeout_seconds: int = int(os.getenv("ROBOT_HEARTBEAT_TIMEOUT_SECONDS", "30"))
     robot_heartbeat_scan_interval_seconds: int = int(os.getenv("ROBOT_HEARTBEAT_SCAN_INTERVAL_SECONDS", "5"))
+    map_storage_dir: str = os.getenv("MAP_STORAGE_DIR", "data/maps")
+    map_active_version_key: str = os.getenv("MAP_ACTIVE_VERSION_KEY", "rds:map:active_version")
+    map_cache_channel: str = os.getenv("MAP_CACHE_CHANNEL", "rds:map:cache:invalidate")
 
 
 settings = Settings()

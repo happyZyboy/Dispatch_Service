@@ -6,18 +6,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.dispatch_status import DispatchStatus
 from common.utils import to_json_text
 from core.conf import settings
-from database.models import AlarmRecord, RobotCurrentState, RobotItem, RobotStatusRecord, WindTaskDef, WorkSite
+from database.models import AlarmRecord, RobotCurrentState, RobotItem, RobotStatusRecord, WindTaskDef
 
 
 async def seed_database(session: AsyncSession) -> None:
     """
-    在对应数据表为空时写入初版任务模板、站点、机器人和报警种子数据。
+    在对应数据表为空时写入初版任务模板、机器人和报警种子数据。
     """
     # 只在空库时补默认数据，避免覆盖手工维护内容。
     if await session.scalar(select(func.count()).select_from(WindTaskDef)) == 0:
         _seed_task_defs(session)
-    if await session.scalar(select(func.count()).select_from(WorkSite)) == 0:
-        _seed_sites(session)
     if await session.scalar(select(func.count()).select_from(RobotItem)) == 0:
         await _seed_robots(session)
     if await session.scalar(select(func.count()).select_from(AlarmRecord)) == 0:
@@ -32,7 +30,7 @@ def _seed_task_defs(session: AsyncSession) -> None:
     # 默认模板只保留最小可跑链路，后面再扩展复杂 block 树。
     default_detail = {
         "inputParams": [
-            {"name": "sitePath", "type": "JSONArray", "label": "按顺序执行的库位路径", "required": True, "defaultValue": []},
+            {"name": "sitePath", "type": "JSONArray", "label": "按顺序执行的地图节点路径", "required": True, "defaultValue": []},
             {"name": "vehicle", "type": "String", "label": "指定车辆", "required": False, "defaultValue": ""},
             {"name": "priority", "type": "Integer", "label": "优先级", "required": False, "defaultValue": 5},
         ],
@@ -58,21 +56,6 @@ def _seed_task_defs(session: AsyncSession) -> None:
     )
 
 
-def _seed_sites(session: AsyncSession) -> None:
-    """
-    创建一组用于联调和演示的默认站点数据。
-    """
-    # 先种一组最小闭环站点：起点、终点、等待位、充电位。
-    session.add_all(
-        [
-            WorkSite(site_id="SITE-A-01", site_name="起点库位A01", area="A仓", group_name="A区", no="001", row_num="1", column_num=1, type_=1),
-            WorkSite(site_id="SITE-B-03", site_name="终点库位B03", area="B仓", group_name="B区", no="002", row_num="3", column_num=1, type_=2),
-            WorkSite(site_id="SITE-WAIT-01", site_name="等待位01", area="公共仓", group_name="等待区", no="003", row_num="1", column_num=2, type_=5),
-            WorkSite(site_id="SITE-CHARGE-01", site_name="充电位01", area="充电仓", group_name="充电区", no="004", row_num="1", column_num=3, type_=4),
-        ]
-    )
-
-
 async def _seed_robots(session: AsyncSession) -> None:
     """
     创建默认机器人档案、机器人状态快照和初始状态流水。
@@ -90,7 +73,7 @@ async def _seed_robots(session: AsyncSession) -> None:
                 vehicle_name=robot_1.robot_name,
                 current_status=1,
                 dispatch_status=DispatchStatus.IDLE,
-                current_site_id="SITE-A-01",
+                current_site_id="LM1",
                 battery_level=88,
                 last_heartbeat_at=robot_1.added_on,
             ),
@@ -100,12 +83,12 @@ async def _seed_robots(session: AsyncSession) -> None:
                 vehicle_name=robot_2.robot_name,
                 current_status=1,
                 dispatch_status=DispatchStatus.IDLE,
-                current_site_id="SITE-B-03",
+                current_site_id="LM3",
                 battery_level=76,
                 last_heartbeat_at=robot_2.added_on,
             ),
-            RobotStatusRecord(uuid=robot_1.uuid, vehicle_name=robot_1.robot_name, old_status=0, new_status=1, location="SITE-A-01"),
-            RobotStatusRecord(uuid=robot_2.uuid, vehicle_name=robot_2.robot_name, old_status=0, new_status=1, location="SITE-B-03"),
+            RobotStatusRecord(uuid=robot_1.uuid, vehicle_name=robot_1.robot_name, old_status=0, new_status=1, location="LM1"),
+            RobotStatusRecord(uuid=robot_2.uuid, vehicle_name=robot_2.robot_name, old_status=0, new_status=1, location="LM3"),
         ]
     )
 

@@ -5,3 +5,5 @@ pydantic==2.11.7
 asyncmy==0.2.10
 redis==6.4.0
 aio-pika>=9.4,<10
+networkx>=3.2,<4
+python-multipart>=0.0.20,<1

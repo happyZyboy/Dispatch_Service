@@ -3,6 +3,8 @@
 -- 1. 面向 MySQL 8.x / InnoDB / utf8mb4
 -- 2. 按文档字段生成，不包含外键约束
 -- 3. 保留主键、唯一索引和常用查询索引，便于后续调度查询
+-- 4. 地图节点由 RobotShop .smap 导入到 t_mapnode，WMS 只提交任务 sitePath
+-- 5. 不再创建独立的 WMS 业务库位表 t_worksite
 
 SET NAMES utf8mb4;
 
@@ -12,11 +14,11 @@ DROP TABLE IF EXISTS `t_windtaskrecord`;
 DROP TABLE IF EXISTS `t_mapedge`;
 DROP TABLE IF EXISTS `t_mapnode`;
 DROP TABLE IF EXISTS `t_mapversion`;
+DROP TABLE IF EXISTS `t_worksite`;
 DROP TABLE IF EXISTS `t_windtaskdef`;
 DROP TABLE IF EXISTS `t_alarmsrecord`;
 DROP TABLE IF EXISTS `robot_current_state`;
 DROP TABLE IF EXISTS `t_robotstatusrecord`;
-DROP TABLE IF EXISTS `t_worksite`;
 DROP TABLE IF EXISTS `t_robotitem`;
 
 CREATE TABLE `t_robotitem` (
@@ -62,7 +64,7 @@ CREATE TABLE `robot_current_state` (
   `current_status` int DEFAULT NULL COMMENT '当前机器人状态',
   `dispatch_status` int NOT NULL DEFAULT 0 COMMENT '当前调度状态，0 离线，1 空闲，2 忙碌，3 充电，4 故障，5 锁定',
   `current_task_id` bigint DEFAULT NULL COMMENT '当前任务记录 ID',
-  `current_site_id` varchar(64) DEFAULT NULL COMMENT '当前地图节点/库位编码，必须使用 RobotShop .smap 的 instanceName',
+  `current_site_id` varchar(64) DEFAULT NULL COMMENT '当前地图节点编码，必须使用 RobotShop .smap 的 instanceName',
   `current_location` varchar(255) DEFAULT NULL COMMENT '当前位置信息',
   `battery_level` decimal(10,2) DEFAULT NULL COMMENT '当前电量',
   `has_unresolved_alarm` int NOT NULL DEFAULT 0 COMMENT '是否有未恢复报警，0 无，1 有',
@@ -78,37 +80,6 @@ CREATE TABLE `robot_current_state` (
   KEY `idx_robot_current_state_current_site_id` (`current_site_id`),
   KEY `idx_robot_current_state_last_heartbeat_at` (`last_heartbeat_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='机器人当前状态快照表';
-
-CREATE TABLE `t_worksite` (
-  `id` bigint NOT NULL COMMENT '主键 ID',
-  `agv_id` varchar(64) DEFAULT NULL COMMENT 'AGV ID',
-  `area` varchar(255) DEFAULT NULL COMMENT '仓库',
-  `disabled` int NOT NULL DEFAULT 0 COMMENT '是否禁用',
-  `filled` int NOT NULL DEFAULT 0 COMMENT '是否已占用',
-  `group_name` varchar(255) DEFAULT NULL COMMENT '库区',
-  `holder` int NOT NULL DEFAULT 0 COMMENT '占位类型',
-  `no` varchar(255) DEFAULT NULL COMMENT '编号',
-  `preparing` int NOT NULL DEFAULT 0 COMMENT '是否预占',
-  `row_num` varchar(255) DEFAULT NULL COMMENT '行号',
-  `column_num` int DEFAULT NULL COMMENT '列号',
-  `site_id` varchar(64) NOT NULL COMMENT '库位业务编码，必须使用 RobotShop .smap advancedPointList.instanceName',
-  `site_name` varchar(255) DEFAULT NULL COMMENT '库位名称',
-  `sync_failed` int NOT NULL DEFAULT 0 COMMENT '是否同步失败',
-  `type` int DEFAULT NULL COMMENT '库位类型',
-  `remark` varchar(255) DEFAULT NULL COMMENT '备注',
-  `added_on` datetime DEFAULT NULL COMMENT '创建时间',
-  `update_on` datetime DEFAULT NULL COMMENT '更新时间',
-  `del` int NOT NULL DEFAULT 0 COMMENT '删除标记，0 正常，1 删除',
-  `working` int NOT NULL DEFAULT 0 COMMENT '是否作业中',
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uk_t_worksite_site_id` (`site_id`),
-  KEY `idx_t_worksite_agv_id` (`agv_id`),
-  KEY `idx_t_worksite_group_name` (`group_name`),
-  KEY `idx_t_worksite_type` (`type`),
-  KEY `idx_t_worksite_status_flags` (`disabled`,`filled`,`preparing`,`working`),
-  KEY `idx_t_worksite_added_on` (`added_on`),
-  KEY `idx_t_worksite_del` (`del`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='库位表';
 
 CREATE TABLE `t_mapversion` (
   `id` bigint NOT NULL COMMENT '地图版本内部主键，建议使用雪花算法生成',
@@ -143,19 +114,32 @@ CREATE TABLE `t_mapnode` (
   `ignore_dir` int NOT NULL DEFAULT 0 COMMENT '是否忽略节点方向，0 否，1 是',
   `properties` longtext COMMENT '地图节点原始属性 JSON',
   `is_enabled` int NOT NULL DEFAULT 1 COMMENT '节点是否启用，0 禁用，1 启用',
+  `agv_id` varchar(64) DEFAULT NULL COMMENT '当前占用或预占该节点的 AGV ID',
+  `filled` int NOT NULL DEFAULT 0 COMMENT '节点是否已被货物占用，0 否，1 是',
+  `holder` int NOT NULL DEFAULT 0 COMMENT '节点占用类型，0 空闲，1 禁用，2 已占用，3 预占，4 作业中',
+  `preparing` int NOT NULL DEFAULT 0 COMMENT '节点是否被任务预占，0 否，1 是',
+  `working` int NOT NULL DEFAULT 0 COMMENT '节点是否正在作业，0 否，1 是',
+  `added_on` datetime NOT NULL COMMENT '节点导入时间',
+  `update_on` datetime NOT NULL COMMENT '节点最后更新时间',
+  `del` int NOT NULL DEFAULT 0 COMMENT '逻辑删除标记，0 正常，1 删除',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_t_mapnode_version_code` (`map_version_id`,`node_code`),
   KEY `idx_t_mapnode_version_type` (`map_version_id`,`node_type`),
-  KEY `idx_t_mapnode_enabled` (`is_enabled`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='地图节点表';
+  KEY `idx_t_mapnode_enabled` (`is_enabled`),
+  KEY `idx_t_mapnode_node_code` (`node_code`),
+  KEY `idx_t_mapnode_agv_id` (`agv_id`),
+  KEY `idx_t_mapnode_status_flags` (`is_enabled`,`filled`,`preparing`,`working`),
+  KEY `idx_t_mapnode_added_on` (`added_on`),
+  KEY `idx_t_mapnode_del` (`del`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='地图节点及运行时资源状态表';
 
 CREATE TABLE `t_mapedge` (
   `id` bigint NOT NULL COMMENT '拓扑边内部主键，建议使用雪花算法生成',
   `map_version_id` bigint NOT NULL COMMENT '所属地图版本 ID，对应 t_mapversion.id',
   `edge_code` varchar(255) NOT NULL COMMENT '拓扑边编码，对应 .smap advancedCurveList.instanceName',
   `edge_type` varchar(64) DEFAULT NULL COMMENT '拓扑边类型，例如 DegenerateBezier',
-  `from_node_code` varchar(128) NOT NULL COMMENT '有向边起点节点编码',
-  `to_node_code` varchar(128) NOT NULL COMMENT '有向边终点节点编码',
+  `from_node_code` varchar(128) NOT NULL COMMENT '有向边起点节点编码，对应 t_mapnode.node_code',
+  `to_node_code` varchar(128) NOT NULL COMMENT '有向边终点节点编码，对应 t_mapnode.node_code',
   `direction` decimal(10,4) DEFAULT NULL COMMENT '地图原始方向属性',
   `move_style` int DEFAULT NULL COMMENT '地图原始移动方式属性',
   `cost` decimal(19,6) DEFAULT NULL COMMENT '路径代价，默认可使用边长度',
@@ -178,7 +162,7 @@ CREATE TABLE `t_windtaskdef` (
   `period` int NOT NULL DEFAULT 0 COMMENT '周期',
   `periodic_task` int NOT NULL DEFAULT 0 COMMENT '是否周期任务',
   `project_id` varchar(255) DEFAULT NULL COMMENT '项目 ID',
-  `release_sites` bit(1) NOT NULL DEFAULT b'0' COMMENT '是否释放站点',
+  `release_sites` bit(1) NOT NULL DEFAULT b'0' COMMENT '任务结束后是否释放地图节点占用',
   `remark` varchar(255) DEFAULT NULL COMMENT '备注',
   `status` int DEFAULT NULL COMMENT '任务定义状态',
   `template_name` varchar(255) DEFAULT NULL COMMENT '模板名称',

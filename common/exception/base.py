@@ -98,6 +98,30 @@ class DispatchFailedError(AppError):
         super().__init__(20001, message, data)
 
 
+class MapNodeNotFoundError(AppError):
+    def __init__(self, message: str = "地图节点不存在", data: Any = None) -> None:
+        """
+        创建地图节点不存在异常，并固定使用错误码 10015。
+        """
+        super().__init__(10015, message, data)
+
+
+class MapRouteNotFoundError(AppError):
+    def __init__(self, message: str = "地图路径不存在", data: Any = None) -> None:
+        """
+        创建地图路径不存在异常，并固定使用错误码 10016。
+        """
+        super().__init__(10016, message, data)
+
+
+class MapVersionUnavailableError(AppError):
+    def __init__(self, message: str = "地图版本不可用", data: Any = None) -> None:
+        """
+        创建地图版本不可用异常，并固定使用错误码 20003。
+        """
+        super().__init__(20003, message, data)
+
+
 class InvalidRmfCallbackError(AppError):
     def __init__(self, message: str = "RMF 回调数据非法", data: Any = None) -> None:
         """

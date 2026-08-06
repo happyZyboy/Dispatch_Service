@@ -8,8 +8,7 @@ Content-Type: application/json
 
 {
   "templateLabel": "MOVE_DEFAULT",
-  "fromSite": "SITE-A-01",
-  "toSite": "SITE-B-03",
+  "sitePath": ["LM1", "LM3"],
   "priority": 8,
   "agvId": "AGV-001",
   "outOrderNo": "WMS202607310001",

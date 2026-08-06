@@ -14,7 +14,7 @@ router = APIRouter(tags=["system"])
 @router.get("/api/v1/health")
 async def health(db: AsyncSession = Depends(get_db)):
     """
-    返回服务健康状态以及任务、机器人和站点数量等运行摘要。
+    返回服务健康状态以及任务、机器人和地图节点数量等运行摘要。
     """
     # 健康检查同时带一点运行态摘要，便于联调时确认数据库已连通。
     return success(await health_snapshot(db))

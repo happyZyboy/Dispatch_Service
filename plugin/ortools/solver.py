@@ -12,16 +12,18 @@ class OrtoolsSolver:
         required_uuid: str | None = None,
         target_site: str | None = None,
         site_positions: dict[str, tuple[int | float | None, int | float | None]] | None = None,
+        route_costs: dict[str, float | None] | None = None,
     ) -> dict[str, Any] | None:
         """
         从候选列表中选择指定机器人，或选择距离首个目标点最近的可调度机器人。
 
-        当前项目的站点表只保存行列坐标，因此先用曼哈顿距离作为资源分配成本。
-        后续接入地图边权后，只需要替换这里的 cost 计算，不影响任务链路。
+        优先使用地图拓扑路径成本；没有地图成本时保留行列坐标作为兼容回退。
         """
         def is_eligible(robot: dict[str, Any]) -> bool:
-            return (
-                robot.get("del_", robot.get("del", 0)) == 0
+            route_available = required_uuid or route_costs is None or route_costs.get(robot.get("uuid")) is not None
+            return bool(
+                route_available
+                and robot.get("del_", robot.get("del", 0)) == 0
                 and robot.get("enable_status", 0) == 1
                 and robot.get("dispatch_status") == DispatchStatus.IDLE
                 and robot.get("has_unresolved_alarm", 0) == 0
@@ -31,6 +33,9 @@ class OrtoolsSolver:
             )
 
         def distance_to_target(robot: dict[str, Any]) -> float | None:
+            if route_costs is not None:
+                value = route_costs.get(robot.get("uuid"))
+                return float(value) if value is not None else None
             if not target_site:
                 return None
             current_site = robot.get("current_site_id")

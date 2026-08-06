@@ -38,6 +38,6 @@ async def block_complete(payload: BlockCallbackRequest, db: AsyncSession = Depen
 @router.post("/block-failed")
 async def block_failed(payload: BlockCallbackRequest, db: AsyncSession = Depends(get_db)):
     """
-    接收 RMF 的流程块失败回调，并统一收口任务、机器人和站点状态。
+    接收 RMF 的流程块失败回调，并统一收口任务、机器人和地图节点状态。
     """
     return success(await handle_block_failed(db, payload))

@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.dispatch.service import trigger_dispatch
 from app.domain import create_task_log
+from app.map.service import run_map_cache_listener
 from common.enums.task_status import TaskStatus
 from common.exception.base import StatusNotAllowedError, TaskNotFoundError
 from common.utils import from_json_text
@@ -36,26 +37,39 @@ class SchedulerWorker:
     async def run(self) -> None:
         await self.redis.ping()
         logger.info("调度 Worker 已启动：%s", self.worker_id)
-        while True:
-            try:
-                await self.queue.requeue_expired(settings.scheduler_requeue_batch_size)
-                await self.queue.promote_due_retries(settings.scheduler_requeue_batch_size)
-                await self._reconcile_pending_tasks_if_due()
-                await self._reconcile_assigned_tasks_if_due()
+        stop_event = asyncio.Event()
+        map_cache_task = asyncio.create_task(
+            run_map_cache_listener(stop_event),
+            name=f"{self.worker_id}-map-cache-listener",
+        )
+        try:
+            while True:
+                try:
+                    await self.queue.requeue_expired(settings.scheduler_requeue_batch_size)
+                    await self.queue.promote_due_retries(settings.scheduler_requeue_batch_size)
+                    await self._reconcile_pending_tasks_if_due()
+                    await self._reconcile_assigned_tasks_if_due()
 
-                claim = await self.queue.claim(self.worker_id)
-                if claim is None:
-                    await asyncio.sleep(settings.scheduler_poll_interval_seconds)
-                    continue
-                await self._process(claim)
+                    claim = await self.queue.claim(self.worker_id)
+                    if claim is None:
+                        await asyncio.sleep(settings.scheduler_poll_interval_seconds)
+                        continue
+                    await self._process(claim)
+                except asyncio.CancelledError:
+                    raise
+                except RedisClientError:
+                    logger.exception("调度 Worker 访问 Redis 失败")
+                    await asyncio.sleep(max(settings.scheduler_poll_interval_seconds, 1))
+                except Exception:
+                    logger.exception("调度 Worker 主循环异常")
+                    await asyncio.sleep(max(settings.scheduler_poll_interval_seconds, 1))
+        finally:
+            stop_event.set()
+            map_cache_task.cancel()
+            try:
+                await map_cache_task
             except asyncio.CancelledError:
-                raise
-            except RedisClientError:
-                logger.exception("调度 Worker 访问 Redis 失败")
-                await asyncio.sleep(max(settings.scheduler_poll_interval_seconds, 1))
-            except Exception:
-                logger.exception("调度 Worker 主循环异常")
-                await asyncio.sleep(max(settings.scheduler_poll_interval_seconds, 1))
+                pass
 
     async def _process(self, claim: TaskClaim) -> None:
         try:

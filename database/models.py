@@ -4,7 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from common.global_vars import id_worker
@@ -87,31 +87,68 @@ class RobotCurrentState(SerializableMixin, Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now, nullable=False)
 
 
-class WorkSite(SerializableMixin, Base):
-    __tablename__ = "t_worksite"
+class MapVersion(SerializableMixin, Base):
+    __tablename__ = "t_mapversion"
 
-    # 库位表同时承担站点、库位、等待位等位置资源的统一表达。
+    # 地图版本表保存 RobotShop 原始地图的导入和激活信息。
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=id_worker.next_id)
+    map_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_version: Mapped[str | None] = mapped_column(String(64), default=None)
+    map_type: Mapped[str | None] = mapped_column(String(64), default=None)
+    resolution: Mapped[float | None] = mapped_column(Numeric(10, 4), default=None)
+    min_x: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    min_y: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    max_x: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    max_y: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    source_file: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    node_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    edge_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", nullable=False, index=True)
+    created_on: Mapped[datetime] = mapped_column(DateTime, default=now, nullable=False)
+    activated_on: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
+
+class MapNode(SerializableMixin, Base):
+    __tablename__ = "t_mapnode"
+    __table_args__ = (UniqueConstraint("map_version_id", "node_code", name="uk_t_mapnode_version_code"),)
+
+    # 地图节点表同时保存 .smap 节点定义和运行时占用状态。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=id_worker.next_id)
+    map_version_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    node_code: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    node_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    x: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    y: Mapped[float | None] = mapped_column(Numeric(12, 4), default=None)
+    ignore_dir: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    properties: Mapped[str | None] = mapped_column(Text, default=None)
+    is_enabled: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     agv_id: Mapped[str | None] = mapped_column(String(64), default=None)
-    area: Mapped[str | None] = mapped_column(String(255), default=None)
-    disabled: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     filled: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    group_name: Mapped[str | None] = mapped_column(String(255), default=None)
     holder: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    no: Mapped[str | None] = mapped_column(String(255), default=None)
     preparing: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    row_num: Mapped[int | None] = mapped_column(Integer, default=None)
-    column_num: Mapped[int | None] = mapped_column(Integer, default=None)
-    site_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
-    site_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    sync_failed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    # `type` 是保留字段名，ORM 里用 `type_` 更安全。
-    type_: Mapped[int] = mapped_column("type", Integer, default=0, nullable=False)
     working: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    remark: Mapped[str | None] = mapped_column(String(255), default=None)
     added_on: Mapped[datetime] = mapped_column(DateTime, default=now, nullable=False)
     update_on: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now, nullable=False)
     del_: Mapped[int] = mapped_column("del", Integer, default=0, nullable=False)
+
+
+class MapEdge(SerializableMixin, Base):
+    __tablename__ = "t_mapedge"
+    __table_args__ = (UniqueConstraint("map_version_id", "edge_code", name="uk_t_mapedge_version_code"),)
+
+    # 地图拓扑边表保存 advancedCurveList 中的有向连接。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, default=id_worker.next_id)
+    map_version_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    edge_code: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    edge_type: Mapped[str | None] = mapped_column(String(64), default=None)
+    from_node_code: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    to_node_code: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    direction: Mapped[float | None] = mapped_column(Numeric(10, 4), default=None)
+    move_style: Mapped[int | None] = mapped_column(Integer, default=None)
+    cost: Mapped[float | None] = mapped_column(Numeric(19, 6), default=None)
+    geometry: Mapped[str | None] = mapped_column(Text, default=None)
+    is_enabled: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
 
 class WindTaskDef(SerializableMixin, Base):
@@ -156,6 +193,7 @@ class WindTaskRecord(SerializableMixin, Base):
     is_del: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     out_order_no: Mapped[str | None] = mapped_column(String(128), default=None)
     path: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    map_version_id: Mapped[int | None] = mapped_column(BigInteger, default=None, index=True)
     periodic_task: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     priority: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     root_task_record_id: Mapped[int | None] = mapped_column(BigInteger, default=None)
