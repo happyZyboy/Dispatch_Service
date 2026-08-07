@@ -20,7 +20,17 @@ class OrtoolsSolver:
         优先使用地图拓扑路径成本；没有地图成本时保留行列坐标作为兼容回退。
         """
         def is_eligible(robot: dict[str, Any]) -> bool:
-            route_available = required_uuid or route_costs is None or route_costs.get(robot.get("uuid")) is not None
+            """
+            判断机器人是否满足参与本次调度的基础条件。
+
+            :param robot: 包含机器人档案、当前状态、电量和当前位置的字典。
+            :return: 机器人满足路径、电量、启用状态、空闲状态和报警条件时返回 True。
+            """
+            route_available = route_costs is None or route_costs.get(robot.get("uuid")) is not None
+            has_coordinate = (
+                robot.get("current_x") is not None
+                and robot.get("current_y") is not None
+            )
             return bool(
                 route_available
                 and robot.get("del_", robot.get("del", 0)) == 0
@@ -29,10 +39,19 @@ class OrtoolsSolver:
                 and robot.get("has_unresolved_alarm", 0) == 0
                 and float(robot.get("battery_level") or 0)
                 >= float(robot.get("battery_threshold") or 0)
-                and bool(robot.get("current_site_id") or robot.get("current_location"))
+                and bool(robot.get("current_site_id") or has_coordinate)
             )
 
         def distance_to_target(robot: dict[str, Any]) -> float | None:
+            """
+            计算机器人到任务目标点的比较成本。
+
+            如果调度前已经计算出地图路径或坐标接入综合成本，则直接使用该成本；
+            否则使用兼容模式，根据机器人和目标节点的行列坐标计算曼哈顿距离。
+
+            :param robot: 包含机器人当前位置和机器人编号的字典。
+            :return: 机器人到目标点的成本；无法计算时返回 None。
+            """
             if route_costs is not None:
                 value = route_costs.get(robot.get("uuid"))
                 return float(value) if value is not None else None

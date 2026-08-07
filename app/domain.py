@@ -10,7 +10,14 @@ from common.enums.dispatch_status import DispatchStatus
 from common.enums.log_level import LogLevel
 from common.enums.robot_status import RobotStatus
 from common.enums.task_status import TaskStatus
-from common.utils import format_dt, from_json_text, normalize_site_path, now, to_json_text
+from common.utils import (
+    format_dt,
+    from_json_text,
+    normalize_site_path,
+    now,
+    robot_location_json,
+    to_json_text,
+)
 from database.models import AlarmRecord, MapNode, RobotCurrentState, RobotStatusRecord, WindBlockRecord, WindTaskLog, WindTaskRecord
 
 TASK_STATUS_DESC = {
@@ -206,6 +213,8 @@ def build_operation_plans(
                 "inputParams": {
                     "from": from_site,
                     "to": to_site,
+                    "segmentType": segment.get("segmentType", "map"),
+                    "startPose": segment.get("startPose"),
                     "scriptName": script_name if step_index == len(valid_segments) else None,
                 },
                 "internalVariables": {
@@ -323,7 +332,7 @@ async def mark_robot_busy(session: AsyncSession, uuid: str, task_id: int, curren
             vehicle_name=state.vehicle_name,
             old_status=RobotStatus.IDLE,
             new_status=RobotStatus.BUSY,
-            location=state.current_location or current_site_id,
+            location=robot_location_json(state.current_x, state.current_y),
         )
     )
 
@@ -349,7 +358,7 @@ async def mark_robot_idle(session: AsyncSession, uuid: str, current_site_id: str
             vehicle_name=state.vehicle_name,
             old_status=previous,
             new_status=RobotStatus.IDLE,
-            location=state.current_location or current_site_id,
+            location=robot_location_json(state.current_x, state.current_y),
         )
     )
 

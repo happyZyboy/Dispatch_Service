@@ -179,6 +179,7 @@ class RmfDispatchConsumer:
             root.status = BlockStatus.RUNNING
             root.started_on = root.started_on or now()
             active_root_id = root.block_id
+            path_snapshot = from_json_text(task.path, {})
 
             task.status = TaskStatus.DISPATCHING
             variables["rmfDispatchStartedAt"] = time.time()
@@ -191,6 +192,8 @@ class RmfDispatchConsumer:
                 "dispatchKey": dispatch_key,
                 "rootBlockId": active_root_id,
                 "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
+                "entryNode": path_snapshot.get("entryNode"),
+                "startPose": path_snapshot.get("startPose"),
                 "root": {
                     "from": planned_segments[0]["from"] if planned_segments else None,
                     "to": planned_segments[-1]["to"] if planned_segments else None,

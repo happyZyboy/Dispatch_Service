@@ -17,7 +17,8 @@ class RobotHeartbeatRequest(BaseModel):
     dispatchStatus: int = Field(default=1, ge=0, le=5)
     currentTaskId: int | None = None
     currentSiteId: str | None = None
-    currentLocation: str | None = None
+    currentX: float | None = None
+    currentY: float | None = None
     batteryLevel: float
     hasUnresolvedAlarm: int
     alarmLevel: str | None = None

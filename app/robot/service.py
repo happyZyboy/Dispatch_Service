@@ -6,7 +6,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.exception.base import RobotNotFoundError, ResourceUnavailableError
-from common.utils import format_dt, now, paginate
+from common.utils import format_dt, now, paginate, robot_location_json
 from database.models import RobotCurrentState, RobotItem, RobotStatusRecord
 from app.robot.enums import EnableStatus
 
@@ -41,7 +41,8 @@ async def list_robot_states(
                 "dispatchStatus": merged.get("dispatch_status"),
                 "currentTaskId": merged.get("current_task_id"),
                 "currentSiteId": merged.get("current_site_id"),
-                "currentLocation": merged.get("current_location"),
+                "currentX": merged.get("current_x"),
+                "currentY": merged.get("current_y"),
                 "batteryLevel": merged.get("battery_level"),
                 "hasUnresolvedAlarm": merged.get("has_unresolved_alarm"),
                 "alarmLevel": merged.get("alarm_level"),
@@ -146,7 +147,7 @@ async def heartbeat(db: AsyncSession, payload) -> dict:
         vehicle_name=payload.vehicleName or robot.robot_name,
         old_status=previous_status,
         new_status=payload.currentStatus,
-        location=payload.currentLocation or payload.currentSiteId,
+        location=robot_location_json(payload.currentX, payload.currentY),
         odo=payload.odo,
         today_odo=payload.todayOdo
     )
@@ -158,7 +159,8 @@ async def heartbeat(db: AsyncSession, payload) -> dict:
     state.dispatch_status = payload.dispatchStatus
     state.current_task_id = payload.currentTaskId
     state.current_site_id = payload.currentSiteId
-    state.current_location = payload.currentLocation
+    state.current_x = payload.currentX
+    state.current_y = payload.currentY
     state.battery_level = payload.batteryLevel
     state.has_unresolved_alarm = payload.hasUnresolvedAlarm
     state.alarm_level = payload.alarmLevel

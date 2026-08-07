@@ -1,7 +1,8 @@
 import unittest
+import json
 
 from app.domain import _build_root_block, build_operation_plans, task_requested_sites
-from common.utils import build_route
+from common.utils import build_route, robot_location_json
 from database.models import WindTaskRecord
 from plugin.ortools.solver import OrtoolsSolver
 
@@ -17,6 +18,11 @@ def _task() -> WindTaskRecord:
 
 
 class SequentialRouteTest(unittest.TestCase):
+    def test_robot_location_is_valid_json_with_numeric_coordinates(self):
+        location = json.loads(robot_location_json("12.3", "5.6"))
+
+        self.assertEqual(location, {"x": 12.3, "y": 5.6})
+
     def test_build_route_adds_robot_position_before_wms_targets(self):
         route = build_route(["SITE-1", "SITE-2"], start_site="ROBOT-SITE")
 

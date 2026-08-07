@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from common.enums.dispatch_status import DispatchStatus
 from common.enums.robot_status import RobotStatus
-from common.utils import now
+from common.utils import now, robot_location_json
 from core.conf import settings
 from database.db import SessionLocal
 from database.models import RobotCurrentState, RobotStatusRecord
@@ -55,7 +55,7 @@ async def scan_stale_robot_heartbeats() -> int:
                     vehicle_name=state.vehicle_name,
                     old_status=state.current_status,
                     new_status=RobotStatus.OFFLINE,
-                    location=state.current_location,
+                    location=robot_location_json(state.current_x, state.current_y),
                 )
                 db.add(offline_record)
                 await db.flush()

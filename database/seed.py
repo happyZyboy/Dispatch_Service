@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.dispatch_status import DispatchStatus
-from common.utils import to_json_text
+from common.utils import robot_location_json, to_json_text
 from core.conf import settings
 from database.models import AlarmRecord, RobotCurrentState, RobotItem, RobotStatusRecord, WindTaskDef
 
@@ -87,8 +87,8 @@ async def _seed_robots(session: AsyncSession) -> None:
                 battery_level=76,
                 last_heartbeat_at=robot_2.added_on,
             ),
-            RobotStatusRecord(uuid=robot_1.uuid, vehicle_name=robot_1.robot_name, old_status=0, new_status=1, location="LM1"),
-            RobotStatusRecord(uuid=robot_2.uuid, vehicle_name=robot_2.robot_name, old_status=0, new_status=1, location="LM3"),
+            RobotStatusRecord(uuid=robot_1.uuid, vehicle_name=robot_1.robot_name, old_status=0, new_status=1, location=robot_location_json()),
+            RobotStatusRecord(uuid=robot_2.uuid, vehicle_name=robot_2.robot_name, old_status=0, new_status=1, location=robot_location_json()),
         ]
     )
 
