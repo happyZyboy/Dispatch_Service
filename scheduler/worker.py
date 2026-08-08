@@ -28,6 +28,11 @@ class SchedulerWorker:
     """复用现有调度服务的单任务 Redis 消费 Worker。"""
 
     def __init__(self, worker_id: str | None = None) -> None:
+        """
+        初始化调度 Worker 及其 Redis 队列客户端。
+
+        :param worker_id: Worker 标识，不传时自动生成一个短标识。
+        """
         self.redis = get_redis()
         self.queue = TaskQueue(self.redis)
         self.worker_id = worker_id or f"scheduler-{uuid.uuid4().hex[:8]}"
@@ -35,6 +40,12 @@ class SchedulerWorker:
         self._last_assigned_reconcile_at = 0.0
 
     async def run(self) -> None:
+        """
+        启动调度 Worker 主循环。
+
+        Worker 会定期回收过期租约、提升到期重试任务、补偿遗漏的任务，
+        然后从 Redis 领取任务并调用调度服务处理。
+        """
         await self.redis.ping()
         logger.info("调度 Worker 已启动：%s", self.worker_id)
         stop_event = asyncio.Event()
@@ -72,6 +83,11 @@ class SchedulerWorker:
                 pass
 
     async def _process(self, claim: TaskClaim) -> None:
+        """
+        处理 Worker 领取到的单个任务。
+
+        :param claim: Redis 返回的任务主键和当前重试次数。
+        """
         try:
             async with SessionLocal() as db:
                 result = await trigger_dispatch(db, claim.task_id, None, False)
@@ -109,6 +125,12 @@ class SchedulerWorker:
         )
 
     async def _suspend_task(self, task_id: int, reason: str) -> None:
+        """
+        因地图版本失效等不可重试原因挂起任务并释放机器人资源。
+
+        :param task_id: 需要挂起的任务主键。
+        :param reason: 挂起原因。
+        """
         async with SessionLocal() as db:
             task = await db.scalar(select(WindTaskRecord).where(WindTaskRecord.id == task_id).with_for_update())
             if not task:
@@ -124,6 +146,12 @@ class SchedulerWorker:
                 await db.commit()
 
     async def _suspend_after_retries(self, task_id: int, error: str) -> None:
+        """
+        在任务达到最大重试次数后将其标记为挂起。
+
+        :param task_id: 重试耗尽的任务主键。
+        :param error: 最后一次调度失败原因。
+        """
         async with SessionLocal() as db:
             task = await db.scalar(select(WindTaskRecord).where(WindTaskRecord.id == task_id).with_for_update())
             if not task:
@@ -135,8 +163,13 @@ class SchedulerWorker:
                 await db.commit()
 
     async def _reconcile_pending_tasks_if_due(self) -> None:
+        """
+        定期扫描待分配任务并补偿写入 Redis 待调度队列。
+
+        该方法用于处理任务已经写入数据库但 Redis 入队失败或消息丢失的情况。
+        """
         now = time.monotonic()
-        if now - self._last_reconcile_at < settings.scheduler_reconcile_interval_seconds:
+        if now - self._last_reconcile_at < settings.scheduler_reconcile_interval_seconds:   #距离上次补偿扫描还没有达到规定间隔，就先不扫描
             return
         self._last_reconcile_at = now
 
@@ -154,6 +187,11 @@ class SchedulerWorker:
             await self.queue.enqueue(task.id, task.priority, task.created_on)
 
     async def _reconcile_assigned_tasks_if_due(self) -> None:
+        """
+        定期扫描已分配但尚未成功投递 RMF 的任务并重新触发投递。
+
+        该补偿逻辑只处理尚未记录 ``rmfPublished`` 的任务。
+        """
         now = time.monotonic()
         if now - self._last_assigned_reconcile_at < settings.scheduler_reconcile_interval_seconds:
             return

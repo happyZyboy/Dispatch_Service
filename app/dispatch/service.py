@@ -7,10 +7,18 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import build_operation_plans, create_task_log, mark_robot_busy, task_requested_sites
-from app.map.graph import MapGraph
+from app.domain import (
+    create_next_operation_block,
+    create_root_block,
+    create_select_robot_block,
+    create_task_log,
+    mark_robot_busy,
+    task_requested_sites,
+)
+from app.map.graph import MapGraph, weighted_entry_cost
 from app.map.service import get_active_map_version, get_map_graph
 from common.enums.block_status import BlockStatus
+from common.enums.dispatch_status import DispatchStatus
 from common.enums.robot_status import RobotStatus
 from common.enums.task_status import TaskStatus
 from common.exception.base import (
@@ -45,7 +53,7 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
     :param force: 是否强制跳过部分任务状态校验。
     :return: 任务分配、地图版本、流程块数量和消息投递状态。
     """
-    task = await _pick_task(db, task_id)
+    task = await _pick_task(db=db, task_id=task_id)
     if task.status not in {TaskStatus.PENDING_ASSIGN, TaskStatus.ASSIGNED, TaskStatus.SUSPENDED} and not force:
         raise StatusNotAllowedError("当前任务状态不允许调度")
 
@@ -55,79 +63,77 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
     if not requested_sites:
         raise ResourceUnavailableError("任务中请求路径为空")
 
-    await _ensure_task_map_version_is_active(db, task)
-    map_version, map_graph = await get_map_graph(db, task.map_version_id)
+    await _ensure_task_map_version_is_active(db=db, task=task)
+    map_version, map_graph = await get_map_graph(db=db, map_version_id=task.map_version_id)
     map_graph.require_nodes(requested_sites)
 
     if reuse_assignment: #任务机器人已经指定
-        selected_uuid = str(task.agv_id)
+        selected_agv_id = str(task.agv_id)
         root = await _active_root(db, task)
         if root is None:
             raise ResourceUnavailableError("任务没有待下发的 RootBp")
         dispatch_key = variables.get("rmfDispatchKey") or _new_dispatch_key(task.id)
     else:
-        candidates = await _robot_candidates(db)
-        start_resolutions: dict[str, dict] = {}
+        # 提交任务时不创建流程块；第一次调度时先创建 RootBp 和选车块占位记录。
+        root = await create_root_block(
+            session=db,
+            task=task,
+            root_step_index=1,
+            target_index=0,
+            from_site=None,
+            to_site=requested_sites[0],
+        )
+        await create_select_robot_block(session=db, task=task, root=root)
+        robots = await _robot_candidates(db=db)
+        target_site = requested_sites[0]
+        required_uuid = agv_id or task.agv_id
+        start_resolutions: dict[str, dict] = {} #各个候选机器人的“起点解析结果”
         route_costs = _candidate_route_costs(
-            candidates,
-            map_graph,
-            requested_sites[0],
-            start_resolutions,
+            robots=robots,
+            map_graph=map_graph,
+            target_site=target_site,
+            start_resolutions=start_resolutions,
         )
         selected = solver.choose_robot(
-            candidates,
-            agv_id or task.agv_id,
-            target_site=requested_sites[0],
+            robots=robots,
+            required_uuid=required_uuid,
+            target_site=target_site,
             route_costs=route_costs,
         )
         if not selected:
             raise ResourceUnavailableError("当前没有可用于调度的机器人")
 
-        selected_uuid = selected["uuid"]
-        start_resolution = start_resolutions.get(selected_uuid)
+        selected_agv_id = selected["uuid"]
+        start_resolution = start_resolutions.get(selected_agv_id)
+
         if start_resolution is None:
-            start_resolution = _robot_start_site(
-                selected,
-                map_graph,
-                requested_sites[0],
+            raise ResourceUnavailableError(
+                f"选中的机器人缺少有效起点解析结果：agv_id={selected_agv_id}"
             )
-        start_site = start_resolution["entryNode"]
+
+        start_site = start_resolution["entryNode"]  #离机器人最近的起点
         resolved_path = build_route(
-            requested_sites,
+            site_path=requested_sites,
             start_site=start_site,
             map_data=map_graph,
             start_pose=start_resolution.get("startPose"),
             entry_node=start_site,
-        )
+            is_at_site=start_resolution["isAtSite"],
+        )   # 这是加上了当前机器人最近的小车库位点的库位或小车位置坐标
+
         _apply_resolved_route(task, resolved_path)
-        task.agv_id = selected_uuid
+
+        task.agv_id = selected_agv_id
         task.status = TaskStatus.ASSIGNED
-        root = await _active_root(db, task)
-        if root is None:
-            raise ResourceUnavailableError("任务没有提交阶段生成的 RootBp")
         dispatch_key = _new_dispatch_key(task.id)
-        select_block = await db.scalar(
-            select(WindBlockRecord).where(
-                WindBlockRecord.task_record_id == task.id,
-                WindBlockRecord.block_name == "CSelectAgvBp",
-            )
-        )
-        if select_block:
-            select_block.status = BlockStatus.SUCCESS
-            select_block.started_on = select_block.started_on or now()
-            select_block.ended_on = now()
-            select_block.output_params = to_json_text({"selectedAgvId": selected_uuid})
-            selection_variables = from_json_text(select_block.internal_variables, {})
-            selection_variables["selectedAgvId"] = selected_uuid
-            select_block.internal_variables = to_json_text(selection_variables)
 
         target_index = _prepare_first_root(
-            root,
-            selected_uuid,
-            start_site,
-            requested_sites,
+            root=root,
+            agv_id=selected_agv_id,
+            start_site=start_site,
+            requested_sites=requested_sites,
             is_at_site=start_resolution["isAtSite"],
-        )
+        )   #target_index当前任务正在处理 WMS 目标列表中的第几个目标点
         if target_index is None:
             root.status = BlockStatus.SUCCESS
             root.started_on = root.started_on or now()
@@ -135,76 +141,98 @@ async def trigger_dispatch(db: AsyncSession, task_id: int | None, agv_id: str | 
             root.output_params = to_json_text({"arrived": True, "currentSite": start_site})
             task.status = TaskStatus.COMPLETED
             task.ended_on = now()
-            variables["selectedAgvId"] = selected_uuid
+            variables["selectedAgvId"] = selected_agv_id
             variables["currentSite"] = start_site
             variables["nextSite"] = None
             variables["currentStepIndex"] = len(requested_sites)
             variables["totalSteps"] = len(requested_sites)
             task.variables = to_json_text(variables)
+            await create_select_robot_block(
+                session=db,
+                task=task,
+                root=root,
+                selected_agv_id=selected_agv_id,
+            )
             create_task_log(db, task.id, "机器人已位于全部目标点，任务直接完成")
             await db.commit()
             return {
                 "taskId": str(task.id),
                 "status": task.status,
-                "agvId": selected_uuid,
+                "agvId": selected_agv_id,
                 "mapVersionId": str(map_version.id),
                 "blockCount": 0,
                 "rabbitStatus": "SKIPPED_ALREADY_AT_TARGET",
             }
 
-        await _reserve_sites(db, task, selected_uuid, resolved_path["route"])
-        await mark_robot_busy(
-            db,
-            selected_uuid,
-            task.id,
-            start_site if start_resolution["isAtSite"] else None,
+        await create_select_robot_block(
+            session=db,
+            task=task,
+            root=root,
+            selected_agv_id=selected_agv_id,
         )
-        create_task_log(db, task.id, f"任务已分配给机器人 {selected_uuid}")
+        await _reserve_sites(
+            db=db,
+            task=task,
+            agv_id=selected_agv_id,
+            route=resolved_path["route"],
+        )
+        await mark_robot_busy(
+            session=db,
+            uuid=selected_agv_id,
+            task_id=task.id,
+            current_site_id=start_site if start_resolution["isAtSite"] else None,
+        )
+        create_task_log(db, task.id, f"任务已分配给机器人 {selected_agv_id}")
 
-    planned_segments = _root_segments(task, root)
+    planned_segments = _root_segments(task=task, root=root)
     if not planned_segments:
         raise ResourceUnavailableError("当前 RootBp 没有可执行的地图路径")
-    task_input = from_json_text(task.input_params, {})
-    operation_plans = build_operation_plans(
-        task,
-        root,
-        planned_segments,
-        script_name=task_input.get("scriptName"),
+    operation_block = await create_next_operation_block(
+        session=db,
+        task=task,
+        root=root,
+        segments=planned_segments,
     )
-    if not operation_plans:
-        raise ResourceUnavailableError("当前 RootBp 没有可拆分的动作子步骤")
+    if operation_block is None:
+        raise ResourceUnavailableError("当前 RootBp 没有可创建的移动步骤")
+    operation_input = from_json_text(operation_block.block_input_params_value, {})
+    operation_variables = from_json_text(operation_block.internal_variables, {})
+    planned_segment = {
+        "from": operation_input.get("from"),
+        "to": operation_input.get("to"),
+        "segmentType": operation_input.get("segmentType", "map"),
+        "startPose": operation_input.get("startPose"),
+        "stepIndex": int(operation_variables.get("stepIndex") or 1),
+    }
 
-    variables["selectedAgvId"] = selected_uuid
+    variables["selectedAgvId"] = selected_agv_id
     variables["rmfDispatchKey"] = dispatch_key
     variables["rmfPublished"] = False
-    root_values = from_json_text(
-        root.block_input_params_value,
-        {},
-    )
-    if root_values.get("from") is not None:
-        variables["currentSite"] = root_values["from"]
-    if root_values.get("to") is not None:
-        variables["nextSite"] = root_values["to"]
     variables["currentRootStepIndex"] = _root_step_index(root)
+    variables["currentOperationIndex"] = planned_segment["stepIndex"]
+    if operation_input.get("from") is not None:
+        variables["currentSite"] = operation_input["from"]
+    variables["nextSite"] = operation_input.get("to")
     task.variables = to_json_text(variables)
 
-    # 先持久化任务分配结果，再向 RabbitMQ 投递消息。
-    await _ensure_task_map_version_is_active(db, task)
+    # 先持久化当前 RootBp 和这一条移动步骤，再向 RabbitMQ 投递消息。
+    await _ensure_task_map_version_is_active(db=db, task=task)
     await db.commit()
     rabbit_status = await _publish_assignment_message(
-        task,
-        selected_uuid,
-        operation_plans,
-        planned_segments,
-        dispatch_key,
-        root.block_id,
+        task=task,
+        agv_id=selected_agv_id,
+        operation_block=operation_block,
+        planned_segment=planned_segment,
+        dispatch_key=dispatch_key,
+        root_block_id=root.block_id,
     )
     return {
         "taskId": str(task.id),
         "status": task.status,
-        "agvId": selected_uuid,
+        "agvId": selected_agv_id,
         "mapVersionId": str(task.map_version_id),
-        "blockCount": len(operation_plans),
+        "blockCount": 1,
+        "operationBlockId": operation_block.block_id,
         "rabbitStatus": rabbit_status,
     }
 
@@ -275,36 +303,40 @@ def _root_step_index(root: WindBlockRecord | None) -> int:
 
 
 def _candidate_route_costs(
-    candidates: list[dict],
+    robots: list[dict],
     map_graph: MapGraph,
     target_site: str,
-    resolutions: dict[str, dict] | None = None,
+    start_resolutions: dict[str, dict] | None = None,
 ) -> dict[str, float | None]:
     """
     计算每个候选机器人到目标节点的综合路径代价。
 
     机器人已经匹配到地图节点时，成本是该节点到目标节点的地图路径代价；
-    机器人只有坐标时，成本是坐标到最近入口节点的距离，再加入口节点到目标
-    节点的地图路径代价。无法定位或不存在可行路径的机器人会记录为 None。
+    机器人只有坐标时，成本是入口节点到目标节点的地图代价乘 0.6，再加坐标
+    到入口节点欧氏距离乘 0.4。无法定位或不存在可行路径的机器人会记录为 None。
 
-    :param candidates: 候选机器人状态字典列表。
+    :param robots: 候选机器人状态字典列表。
     :param map_graph: 任务绑定地图版本对应的内存地图图对象。
     :param target_site: 任务第一个目标地图节点编码。
-    :param resolutions: 可选的机器人起点解析结果缓存，供选车后复用同一个入口节点。
+    :param start_resolutions: 可选的机器人起点解析结果缓存，供选车后复用同一个入口节点。
     :return: 机器人编码到路径代价的映射，无法规划时对应值为 None。
     """
     costs: dict[str, float | None] = {}
-    for robot in candidates:
+    for robot in robots:
         uuid = str(robot.get("uuid") or "")
         if not uuid:
             continue
-        resolution = _robot_start_site(robot, map_graph, target_site)
+        resolution = _robot_start_site(
+            robot=robot,
+            map_graph=map_graph,
+            target_site=target_site,
+        )
         if resolution is None:
             costs[uuid] = None
             continue
         costs[uuid] = float(resolution["totalCost"])
-        if resolutions is not None:
-            resolutions[uuid] = resolution
+        if start_resolutions is not None:
+            start_resolutions[uuid] = resolution
     return costs
 
 
@@ -317,7 +349,7 @@ def _robot_start_site(
     解析机器人执行当前任务时使用的地图接入起点。
 
     如果机器人有有效的 ``current_site_id``，直接使用该节点；如果只有
-    ``current_x/current_y``，则在所有能够到达目标节点的路径入口中选择最近者。
+    ``current_x/current_y``，则在所有能够到达目标节点的路径入口中选择综合代价最低者。
 
     :param robot: 包含机器人当前状态的字典。
     :param map_graph: 任务绑定地图版本对应的内存地图图对象。
@@ -326,6 +358,9 @@ def _robot_start_site(
         没有坐标、节点或可行路径时返回 None。
     """
     current_site = str(robot.get("current_site_id") or "").strip()
+    current_x = robot.get("current_x")
+    current_y = robot.get("current_y")
+
     if current_site:
         if not map_graph.has_node(current_site):
             return None
@@ -337,13 +372,11 @@ def _robot_start_site(
             "entryNode": current_site,  #机器人当前所在的地图节点
             "routeCost": float(route_cost),
             "approachDistance": 0.0, #机器人真实坐标到地图接入节点的距离。因为机器人已经在节点上，所以是 0.0
-            "totalCost": float(route_cost),
-            "startPose": None, #机器人真实坐标
+            "totalCost": weighted_entry_cost(route_cost, 0.0),
+            "startPose": {"x": float(current_x), "y": float(current_y)}, #机器人真实坐标
             "isAtSite": True,
         }
 
-    current_x = robot.get("current_x")
-    current_y = robot.get("current_y")
     if current_x is None or current_y is None:
         return None
     try:
@@ -378,7 +411,11 @@ def _apply_resolved_route(task: WindTaskRecord, route: dict) -> None:
         raise ResourceUnavailableError("无法生成机器人实际起点")
     params = from_json_text(task.input_params, {})
     requested_sites = params.get("sitePath") or []
-    params["from"] = route.get("entryNode") or resolved_route[0]
+    params["from"] = (
+        route.get("entryNode")
+        if route.get("isAtSite", True)
+        else None
+    )
     params["to"] = requested_sites[-1]
     params["sitePath"] = requested_sites
     if route.get("entryNode"):
@@ -400,7 +437,7 @@ def _root_segments(task: WindTaskRecord, root: WindBlockRecord) -> list[dict]:
     root_values = from_json_text(root.block_input_params_value, {})
     from_site = root_values.get("from")
     to_site = root_values.get("to")
-    if not from_site or not to_site:
+    if to_site is None:
         return []
 
     path = from_json_text(task.path, {})
@@ -451,18 +488,27 @@ def _prepare_first_root(
         while target_index < len(requested_sites) and requested_sites[target_index] == start_site:
             target_index += 1
     if target_index >= len(requested_sites):
-        _hydrate_first_root(root, agv_id, start_site, start_site, target_index)
+        _hydrate_first_root(root, agv_id, start_site, start_site, target_index, is_at_site)
         return None
-    _hydrate_first_root(root, agv_id, start_site, requested_sites[target_index], target_index)
+    root_from = start_site if is_at_site else None
+    _hydrate_first_root(
+        root,
+        agv_id,
+        root_from,
+        requested_sites[target_index],
+        target_index,
+        is_at_site,
+    )
     return target_index
 
 
 def _hydrate_first_root(
     root: WindBlockRecord,
     agv_id: str,
-    from_site: str,
+    from_site: str | None,
     to_site: str,
     target_index: int,
+    is_at_site: bool = True,
 ) -> None:
     """
     把机器人、起点、终点和目标下标写入第一个 RootBp。
@@ -472,17 +518,23 @@ def _hydrate_first_root(
     :param from_site: 当前 RootBp 的起点节点编码。
     :param to_site: 当前 RootBp 的终点节点编码。
     :param target_index: 终点在任务目标节点列表中的下标。
+    :param is_at_site: 机器人是否已经确认位于 from_site。
     :return: 无返回值。
     """
     if not root:
         raise ResourceUnavailableError("任务缺少第一个 RootBp")
     root_values = from_json_text(root.block_input_params_value, {})
-    root_values.update({"from": from_site, "to": to_site})
+    root_values.update(
+        {
+            "from": from_site,
+            "to": to_site,
+            "pendingStart": not is_at_site,
+        }
+    )
     root.block_input_params_value = to_json_text(root_values)
     root_variables = from_json_text(root.internal_variables, {})
     root_variables["selectedAgvId"] = agv_id
     root_variables["targetIndex"] = target_index
-    root_variables.pop("pendingStart", None)
     root.internal_variables = to_json_text(root_variables)
 
 
@@ -490,8 +542,8 @@ def _hydrate_first_root(
 async def _publish_assignment_message(
     task: WindTaskRecord,
     agv_id: str,
-    operation_plans: list[dict],
-    planned_segments: list[dict],
+    operation_block: WindBlockRecord,
+    planned_segment: dict,
     dispatch_key: str,
     root_block_id: str,
 ) -> str:
@@ -500,28 +552,36 @@ async def _publish_assignment_message(
 
     :param task: 已完成机器人分配和路径规划的任务 ORM 对象。
     :param agv_id: 已选中的机器人编码。
-    :param operation_plans: 当前 RootBp 拆分出的动作子步骤。
-    :param planned_segments: 当前 RootBp 对应的地图路径边列表。
+    :param operation_block: 当前要发送的 CAgvOperationBp 数据库记录。
+    :param planned_segment: 当前要发送的一条地图路径分段。
     :param dispatch_key: 本次调度投递的唯一调度键。
     :param root_block_id: 当前 RootBp 的流程块编码。
     :return: RabbitMQ 投递状态，成功时为 PUBLISHED，失败时为 PENDING_RABBITMQ。
     """
+    operation = {
+        "blockId": operation_block.block_id,
+        "parentBlockId": operation_block.parent_block_id,
+        "blockName": operation_block.block_name,
+        "orderId": operation_block.order_id,
+        "inputParams": from_json_text(operation_block.block_input_params_value, {}),
+        "internalVariables": from_json_text(operation_block.internal_variables, {}),
+    }
     payload = {
         "event": "task.assigned",
         "taskId": str(task.id),
         "agvId": agv_id,
         "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
-        "blockCount": len(operation_plans),
+        "blockCount": 1,
         "rootBlockId": root_block_id,
         "dispatchKey": dispatch_key,
         "entryNode": from_json_text(task.path, {}).get("entryNode"),
         "startPose": from_json_text(task.path, {}).get("startPose"),
         "root": {
-            "from": planned_segments[0]["from"] if planned_segments else None,
-            "to": planned_segments[-1]["to"] if planned_segments else None,
+            "from": planned_segment.get("from"),
+            "to": planned_segment.get("to"),
         },
-        "segments": planned_segments,
-        "operations": operation_plans,
+        "segments": [planned_segment],
+        "operations": [operation],
     }
     try:
         await publish_rmf_dispatch(payload)
@@ -578,7 +638,20 @@ async def _robot_candidates(db: AsyncSession) -> list[dict]:
     payload = []
     for robot in robots:
         state = states.get(robot.uuid)
-        if not state or state.last_heartbeat_at is None or state.last_heartbeat_at < heartbeat_cutoff or state.current_status != RobotStatus.IDLE:
+        if (
+            not state
+            or state.last_heartbeat_at is None
+            or state.last_heartbeat_at < heartbeat_cutoff
+            or state.current_status != RobotStatus.IDLE
+            or state.dispatch_status != DispatchStatus.IDLE
+            or state.has_unresolved_alarm != 0
+            or robot.enable_status != 1
+            or float(state.battery_level or 0) < float(robot.battery_threshold or 0)
+            or not (
+                state.current_site_id
+                or (state.current_x is not None and state.current_y is not None)
+            )
+        ):
             continue
         merged = robot.to_dict()
         merged.update(state.to_dict())

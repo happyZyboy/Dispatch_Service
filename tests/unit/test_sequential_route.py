@@ -1,20 +1,8 @@
 import unittest
 import json
 
-from app.domain import _build_root_block, build_operation_plans, task_requested_sites
 from common.utils import build_route, robot_location_json
-from database.models import WindTaskRecord
 from plugin.ortools.solver import OrtoolsSolver
-
-
-def _task() -> WindTaskRecord:
-    return WindTaskRecord(
-        id=100,
-        input_params='{"sitePath":["SITE-1","SITE-2","SITE-3"]}',
-        path='{"sitePath":["SITE-1","SITE-2","SITE-3"],"route":["SITE-1","SITE-2","SITE-3"]}',
-        variables="{}",
-        agv_id="AGV-001",
-    )
 
 
 class SequentialRouteTest(unittest.TestCase):
@@ -34,39 +22,6 @@ class SequentialRouteTest(unittest.TestCase):
                 {"stepIndex": 2, "from": "SITE-1", "to": "SITE-2"},
             ],
         )
-
-
-    def test_root_blocks_are_scoped_to_one_target_phase(self):
-        task = _task()
-        root = _build_root_block(task, root_step_index=1, target_index=0, from_site="ROBOT-SITE", to_site="SITE-1")
-        plans = build_operation_plans(
-            task,
-            root,
-            [
-                {"from": "ROBOT-SITE", "to": "SITE-MIDDLE"},
-                {"from": "SITE-MIDDLE", "to": "SITE-1"},
-            ],
-        )
-
-        self.assertEqual(task_requested_sites(task), ["SITE-1", "SITE-2", "SITE-3"])
-        self.assertEqual(root.block_name, "RootBp")
-        self.assertEqual(len(plans), 2)
-        self.assertEqual(plans[0]["parentBlockId"], root.block_id)
-        self.assertEqual(plans[0]["inputParams"]["to"], "SITE-MIDDLE")
-        self.assertEqual(plans[1]["inputParams"]["to"], "SITE-1")
-        self.assertIsNone(plans[0]["inputParams"]["scriptName"])
-
-        plans_with_script = build_operation_plans(
-            task,
-            root,
-            [
-                {"from": "ROBOT-SITE", "to": "SITE-MIDDLE"},
-                {"from": "SITE-MIDDLE", "to": "SITE-1"},
-            ],
-            script_name="binTask",
-        )
-        self.assertIsNone(plans_with_script[0]["inputParams"]["scriptName"])
-        self.assertEqual(plans_with_script[1]["inputParams"]["scriptName"], "binTask")
 
 
     def test_solver_prefers_nearest_eligible_robot_before_battery(self):

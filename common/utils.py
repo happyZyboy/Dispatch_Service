@@ -99,6 +99,7 @@ def build_route(
     map_data: Any | None = None,
     start_pose: dict[str, float] | None = None,
     entry_node: str | None = None,
+    is_at_site: bool | None = None,
 ) -> dict[str, Any]:
     """
     根据 WMS 的有序目标库位列表和机器人当前位置生成可执行路径。
@@ -106,15 +107,12 @@ def build_route(
     提交任务时还没有选定机器人，只有目标库位，因此此时不传 start_site；
     调度选车后再传入机器人所在节点或坐标接入节点，生成完整路线和分段信息。
 
-    当机器人只有坐标时，``start_pose`` 保存真实坐标，``entry_node`` 保存坐标
-    接入的地图节点，并额外生成一段 ``coordinateApproach``，避免把接入节点
-    误认为机器人已经到达。
-
     :param site_path: 按执行顺序排列的目标地图节点编码。
     :param start_site: 机器人当前节点或坐标接入节点编码。
     :param map_data: 可选的 MapGraph，用于计算地图最短路径。
-    :param start_pose: 机器人当前真实坐标，仅坐标接入时传入。
+    :param start_pose: 机器人当前真实坐标，有坐标时始终保存。
     :param entry_node: 坐标接入节点编码，默认使用 start_site。
+    :param is_at_site: 机器人是否已经位于 start_site；为 False 时创建坐标接入段。
     :return: 包含目标路径、地图节点路线和分段信息的字典。
     """
     requested_route = normalize_site_path(site_path)
@@ -129,13 +127,13 @@ def build_route(
         }
 
     waypoints = [resolved_start, *requested_route]
-    route: list[str] = []
+    route: list[str] = [] #装了起点到终点所有库位点，不止是wms传的库位列表
     segments = []
-    if start_pose and resolved_entry:
+    if start_pose and resolved_entry and is_at_site is False:
         segments.append(
             {
                 "stepIndex": 1,
-                "from": resolved_entry,
+                "from": None,
                 "to": resolved_entry,
                 "segmentType": "coordinateApproach",
                 "startPose": start_pose,
@@ -152,21 +150,31 @@ def build_route(
         else:
             route.extend(leg_route)
         for index in range(len(leg_route) - 1):
-            segments.append(
-                {
-                    "stepIndex": len(segments) + 1,
-                    "from": leg_route[index],
-                    "to": leg_route[index + 1],
-                }
-            )
+            segment = {
+                "stepIndex": len(segments) + 1,
+                "from": leg_route[index],
+                "to": leg_route[index + 1],
+            }
+            # 机器人已确认位于库位点时，第一条地图段也记录真实起点。
+            if is_at_site is True and not segments and index == 0:
+                segment.update(
+                    {
+                        "segmentType": "siteApproach",
+                        "startPose": start_pose,
+                    }
+                )
+            segments.append(segment)
 
-    return {
+    result = {
         "sitePath": requested_route,
         "route": route,
         "segments": segments,
         "entryNode": resolved_entry,
         "startPose": start_pose,
     }
+    if is_at_site is not None:
+        result["isAtSite"] = is_at_site
+    return result
 
 
 def plan_map_segment(

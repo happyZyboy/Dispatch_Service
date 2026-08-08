@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import create_next_root_block, create_task_log, mark_robot_idle, refresh_alarm_snapshot, task_requested_sites, update_task_progress
+from app.domain import create_next_operation_block, create_next_root_block, create_task_log, mark_robot_idle, refresh_alarm_snapshot, task_requested_sites, update_task_progress
 from common.enums.block_status import BlockStatus
 from common.enums.task_status import TaskStatus
 from common.exception.base import InvalidRmfCallbackError, TaskNotFoundError
@@ -85,22 +85,41 @@ async def handle_block_complete(db: AsyncSession, payload) -> dict:
     if root is None:
         raise InvalidRmfCallbackError("RMF 回调数据非法：动作块没有所属 RootBp")
 
-    remaining = (
-        await db.scalars(
-            select(WindBlockRecord).where(
-                WindBlockRecord.task_record_id == task.id,
-                WindBlockRecord.parent_block_id == root.block_id,
-                WindBlockRecord.block_name == "CAgvOperationBp",
-                WindBlockRecord.status != BlockStatus.SUCCESS,
-            )
-        )
-    ).all()
-    if remaining:
-        task.status = TaskStatus.EXECUTING
-        await update_task_progress(db, task)
+    arrived_site = _block_to_site(block)
+    # 当前动作完成后，只创建当前 RootBp 的下一条动作；数据库中始终只保留一条待消费动作。
+    from app.dispatch.service import _root_segments, trigger_dispatch
+
+    next_operation = await create_next_operation_block(
+        session=db,
+        task=task,
+        root=root,
+        segments=_root_segments(task, root),
+    )
+    if next_operation is not None:
+        next_input = from_json_text(next_operation.block_input_params_value, {})
+        next_variables = from_json_text(next_operation.internal_variables, {})
+        task.status = TaskStatus.ASSIGNED
+        variables = from_json_text(task.variables, {})
+        variables["currentSite"] = arrived_site or variables.get("currentSite")
+        variables["nextSite"] = next_input.get("to")
+        variables["currentOperationIndex"] = int(next_variables.get("stepIndex") or 1)
+        variables["rmfPublished"] = False
+        variables.pop("rmfDispatchKey", None)
+        variables.pop("rmfTaskId", None)
+        task.variables = to_json_text(variables)
         rmf_client.report_complete({"taskId": task.id, "blockId": block.block_id})
         await db.commit()
-        return {"taskId": str(task.id), "blockId": block.block_id, "status": block.status, "taskStatus": task.status}
+
+        dispatch_result = await trigger_dispatch(db, task.id, task.agv_id, False)
+        return {
+            "taskId": str(task.id),
+            "blockId": block.block_id,
+            "rootBlockId": root.block_id,
+            "nextOperationBlockId": next_operation.block_id,
+            "status": block.status,
+            "taskStatus": task.status,
+            "nextDispatch": dispatch_result,
+        }
 
     root.status = BlockStatus.SUCCESS
     root.started_on = root.started_on or block.started_on or now()
@@ -120,7 +139,7 @@ async def handle_block_complete(db: AsyncSession, payload) -> dict:
         await db.commit()
         return {"taskId": str(task.id), "blockId": block.block_id, "rootBlockId": root.block_id, "status": block.status, "taskStatus": task.status}
 
-    arrived_site = _block_to_site(block) or requested_sites[target_index]
+    arrived_site = arrived_site or requested_sites[target_index]
     next_blocks = await create_next_root_block(db, task, arrived_site, next_target_index)
     task.status = TaskStatus.ASSIGNED
     variables = from_json_text(task.variables, {})
@@ -135,8 +154,6 @@ async def handle_block_complete(db: AsyncSession, payload) -> dict:
     await db.commit()
 
     # 重新复用调度入口，只发布新创建的 RootBp，不重复选车。
-    from app.dispatch.service import trigger_dispatch
-
     dispatch_result = await trigger_dispatch(db, task.id, task.agv_id, False)
     return {
         "taskId": str(task.id),

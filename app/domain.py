@@ -124,35 +124,106 @@ def task_requested_sites(task: WindTaskRecord) -> list[str]:
     return normalize_site_path(params.get("sitePath") or [])
 
 
-async def create_initial_block_plan(session: AsyncSession, task: WindTaskRecord) -> list[WindBlockRecord]:
+async def create_root_block(
+    session: AsyncSession,
+    task: WindTaskRecord,
+    root_step_index: int,
+    target_index: int,
+    from_site: str | None,
+    to_site: str,
+) -> WindBlockRecord:
     """
-    在任务提交阶段创建选车流程块和第一个占位 RootBp。
+    在调度阶段幂等创建一个 RootBp 流程块。
 
-    第一个 RootBp 只有在选定机器人后才能确定 ``from`` 地图节点，因此提交阶段先留空，
-    后续由调度服务补全。
+    第一个 RootBp 创建时可以把 ``from`` 留为空，表示机器人真实起点还需要
+    通过选车和地图接入计算确定；后续 RootBp 则直接使用上一阶段的目标节点作为起点。
+
+    :param session: 当前异步数据库会话。
+    :param task: 当前任务记录。
+    :param root_step_index: RootBp 阶段序号，从 1 开始。
+    :param target_index: 当前目标在 WMS sitePath 中的下标。
+    :param from_site: 当前阶段的地图起点，可以为空。
+    :param to_site: 当前阶段的目标地图节点。
+    :return: 已存在或新创建的 RootBp 记录。
     """
-    existing = (
-        await session.scalars(
-            select(WindBlockRecord).where(WindBlockRecord.task_record_id == task.id).order_by(WindBlockRecord.id.asc())
+    root_block_id = f"{task.id}-root-{root_step_index}"
+    existing = await session.scalar(
+        select(WindBlockRecord).where(
+            WindBlockRecord.task_record_id == task.id,
+            WindBlockRecord.block_id == root_block_id,
+            WindBlockRecord.block_name == "RootBp",
         )
-    ).all()
+    )
     if existing:
         return existing
 
-    requested_sites = task_requested_sites(task)
-    if not requested_sites:
-        return []
-    blocks = [WindBlockRecord(
-        task_record_id=task.id,
-        block_id=f"{task.id}-select-agv",
-        block_name="CSelectAgvBp",
-        status=BlockStatus.CREATED,
-        block_input_params_value=to_json_text({"keyRoute": requested_sites[0], "vehicle": task.agv_id or ""}),
-        output_params=to_json_text({"selectedAgvId": task.agv_id or ""}),
-        internal_variables=to_json_text({"selectedAgvId": ""}),
-    ), _build_root_block(task, root_step_index=1, target_index=0, from_site=None, to_site=requested_sites[0])]
-    session.add_all(blocks)
-    return blocks
+    root = _build_root_block(
+        task,
+        root_step_index=root_step_index,
+        target_index=target_index,
+        from_site=from_site,
+        to_site=to_site,
+    )
+    session.add(root)
+    await session.flush()
+    return root
+
+
+async def create_select_robot_block(
+    session: AsyncSession,
+    task: WindTaskRecord,
+    root: WindBlockRecord,
+    selected_agv_id: str | None = None,
+) -> WindBlockRecord:
+    """
+    创建或更新当前 RootBp 下的 CSelectAgvBp 选车步骤。
+
+    机器人选定后再次调用本方法，会把选中的机器人写入输出参数和内部变量，
+    并将选车步骤标记为成功；这样指定机器人和自动选车共用同一套记录逻辑。
+
+    :param session: 当前异步数据库会话。
+    :param task: 当前任务记录。
+    :param root: CSelectAgvBp 所属的父 RootBp。
+    :param selected_agv_id: 已选中的机器人编码，创建占位记录时可以为空。
+    :return: 已存在或新创建的 CSelectAgvBp 记录。
+    """
+    existing = await session.scalar(
+        select(WindBlockRecord).where(
+            WindBlockRecord.task_record_id == task.id,
+            WindBlockRecord.parent_block_id == root.block_id,
+            WindBlockRecord.block_name == "CSelectAgvBp",
+        )
+    )
+    select_block = existing
+    if select_block is None:
+        requested_sites = task_requested_sites(task)
+        select_block = WindBlockRecord(
+            task_record_id=task.id,
+            parent_block_id=root.block_id,
+            block_id=f"{root.block_id}-select-agv",
+            block_name="CSelectAgvBp",
+            status=BlockStatus.CREATED,
+            block_input_params_value=to_json_text(
+                {
+                    "keyRoute": requested_sites[0] if requested_sites else None,
+                    "vehicle": task.agv_id or "",
+                }
+            ),
+            output_params=to_json_text({"selectedAgvId": ""}),
+            internal_variables=to_json_text({"selectedAgvId": ""}),
+        )
+        session.add(select_block)
+
+    if selected_agv_id:
+        selected_agv_id = str(selected_agv_id)
+        select_block.status = BlockStatus.SUCCESS
+        select_block.started_on = select_block.started_on or now()
+        select_block.ended_on = now()
+        select_block.output_params = to_json_text({"selectedAgvId": selected_agv_id})
+        select_block.internal_variables = to_json_text({"selectedAgvId": selected_agv_id})
+
+    await session.flush()
+    return select_block
 
 
 def _build_root_block(
@@ -175,96 +246,100 @@ def _build_root_block(
         block_name="RootBp",
         status=BlockStatus.CREATED,
         block_input_params_value=to_json_text(
-            {"from": from_site, "to": to_site}
+            {
+                "from": from_site,
+                "to": to_site,
+                "pendingStart": from_site is None,
+            }
         ),
-        internal_variables=to_json_text(
-            {**common_variables, "pendingStart": from_site is None}
-        ),
+        internal_variables=to_json_text(common_variables),
         output_params=to_json_text({}),
     )
 
 
-def build_operation_plans(
-    task: WindTaskRecord,
-    root: WindBlockRecord,
-    segments: list[dict[str, Any]],
-    script_name: str | None = None,
-) -> list[dict[str, Any]]:
-    """把当前 RootBp 的地图路径拆成可投递给 RabbitMQ 的动作子步骤描述。"""
-    root_variables = from_json_text(root.internal_variables, {})
-    root_step_index = int(root_variables.get("rootStepIndex") or 0)
-    target_index = int(root_variables.get("targetIndex") or 0)
-    selected_agv_id = str(root_variables.get("selectedAgvId") or task.agv_id or "")
-    valid_segments = [
-        segment
-        for segment in segments
-        if segment.get("from") and segment.get("to")
-    ]
-    plans: list[dict[str, Any]] = []
-    for step_index, segment in enumerate(valid_segments, start=1):
-        from_site = segment.get("from")
-        to_site = segment.get("to")
-        plans.append(
-            {
-                "blockId": f"{root.block_id}-op-{step_index}",
-                "parentBlockId": root.block_id,
-                "blockName": "CAgvOperationBp",
-                "orderId": f"RMF-{task.id}-{root_step_index}-{step_index}",
-                "inputParams": {
-                    "from": from_site,
-                    "to": to_site,
-                    "segmentType": segment.get("segmentType", "map"),
-                    "startPose": segment.get("startPose"),
-                    "scriptName": script_name if step_index == len(valid_segments) else None,
-                },
-                "internalVariables": {
-                    "rootStepIndex": root_step_index,
-                    "targetIndex": target_index,
-                    "selectedAgvId": selected_agv_id,
-                    "stepIndex": step_index,
-                },
-            }
-        )
-    return plans
-
-
-async def create_operation_blocks(
+async def create_next_operation_block(
     session: AsyncSession,
     task: WindTaskRecord,
     root: WindBlockRecord,
-    plans: list[dict[str, Any]],
-) -> list[WindBlockRecord]:
-    """RabbitMQ 消费后幂等创建当前 RootBp 的动作子步骤。"""
-    existing = (
+    segments: list[dict[str, Any]],
+) -> WindBlockRecord | None:
+    """
+    为当前 RootBp 按路线顺序创建下一条 CAgvOperationBp。
+
+    当前阶段只保留一条尚未完成的移动步骤：如果已经存在未完成的步骤，
+    直接返回它；如果上一条已经完成，则根据下一个地图分段创建新步骤。
+    坐标接入分段允许 ``from`` 为空，表示从机器人真实坐标移动到第一个地图节点。
+
+    :param session: 当前异步数据库会话。
+    :param task: 当前任务记录。
+    :param root: 当前动作所属的 RootBp。
+    :param segments: 当前 RootBp 对应的连续地图分段。
+    :return: 下一条已存在或新创建的动作步骤；没有剩余分段时返回 None。
+    """
+    operation_blocks = (
         await session.scalars(
-            select(WindBlockRecord).where(
+            select(WindBlockRecord)
+            .where(
                 WindBlockRecord.task_record_id == task.id,
                 WindBlockRecord.parent_block_id == root.block_id,
                 WindBlockRecord.block_name == "CAgvOperationBp",
             )
+            .order_by(WindBlockRecord.id.asc())
         )
     ).all()
-    existing_by_id = {block.block_id: block for block in existing}
-    blocks: list[WindBlockRecord] = []
-    for plan in plans:
-        block_id = str(plan["blockId"])
-        block = existing_by_id.get(block_id)
-        if block is None:
-            block = WindBlockRecord(
-                task_record_id=task.id,
-                parent_block_id=root.block_id,
-                block_id=block_id,
-                block_name=str(plan.get("blockName") or "CAgvOperationBp"),
-                order_id=str(plan.get("orderId") or ""),
-                status=BlockStatus.CREATED,
-                block_input_params_value=to_json_text(plan.get("inputParams") or {}),
-                internal_variables=to_json_text(plan.get("internalVariables") or {}),
-                output_params=to_json_text({}),
-            )
-            session.add(block)
-        blocks.append(block)
+    for operation_block in operation_blocks:
+        if operation_block.status != BlockStatus.SUCCESS:
+            return operation_block
+
+    next_index = len(operation_blocks)
+    if next_index >= len(segments):
+        return None
+
+    segment = segments[next_index]
+    root_variables = from_json_text(root.internal_variables, {})
+    root_step_index = int(root_variables.get("rootStepIndex") or 0)
+    target_index = int(root_variables.get("targetIndex") or 0)
+    selected_agv_id = str(root_variables.get("selectedAgvId") or task.agv_id or "")
+    block_id = f"{root.block_id}-op-{next_index + 1}"
+    existing = await session.scalar(
+        select(WindBlockRecord).where(
+            WindBlockRecord.task_record_id == task.id,
+            WindBlockRecord.block_id == block_id,
+            WindBlockRecord.block_name == "CAgvOperationBp",
+        )
+    )
+    if existing:
+        return existing
+
+    operation_block = WindBlockRecord(
+        task_record_id=task.id,
+        parent_block_id=root.block_id,
+        block_id=block_id,
+        block_name="CAgvOperationBp",
+        order_id=f"RMF-{task.id}-{root_step_index}-{next_index + 1}",
+        status=BlockStatus.CREATED,
+        block_input_params_value=to_json_text(
+            {
+                "from": segment.get("from"),
+                "to": segment.get("to"),
+                "scriptName": "move",
+                "segmentType": segment.get("segmentType", "map"),
+                "startPose": segment.get("startPose"),
+            }
+        ),
+        internal_variables=to_json_text(
+            {
+                "rootStepIndex": root_step_index,
+                "targetIndex": target_index,
+                "selectedAgvId": selected_agv_id,
+                "stepIndex": next_index + 1,
+            }
+        ),
+        output_params=to_json_text({}),
+    )
+    session.add(operation_block)
     await session.flush()
-    return blocks
+    return operation_block
 
 
 async def create_next_root_block(

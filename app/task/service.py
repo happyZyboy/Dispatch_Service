@@ -6,8 +6,7 @@ from redis.exceptions import RedisError as RedisClientError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain import create_initial_block_plan, create_task_log, mark_robot_idle, release_reserved_map_nodes, serialize_task
-from app.dispatch.service import trigger_dispatch
+from app.domain import create_task_log, mark_robot_idle, release_reserved_map_nodes, serialize_task
 from app.map.service import get_map_graph
 from common.enums.task_status import TaskStatus
 from common.exception.base import RequestParamError, ResourceUnavailableError, RobotNotFoundError, StatusNotAllowedError, TaskNotFoundError, TemplateNotFoundError
@@ -82,26 +81,7 @@ async def submit_task(
     )
     db.add(task)
     await db.flush()
-    await create_initial_block_plan(db, task)
-    await db.flush()
     create_task_log(db, task.id, f"任务创建成功，WMS 路径={requested_sites}")
-    if agv_id:
-        dispatch_result = await trigger_dispatch(db, task.id, agv_id, False)
-        await db.refresh(task)
-        return {
-            "taskId": str(task.id),
-            "status": task.status,
-            "fromSite": from_json_text(task.input_params, {}).get("from"),
-            "toSite": requested_sites[-1],
-            "sitePath": requested_sites,
-            "mapVersionId": str(task.map_version_id) if task.map_version_id else None,
-            "agvId": agv_id,
-            "outOrderNo": out_order_no,
-            "priority": priority,
-            "createdOn": task.to_dict()["created_on"],
-            "queueStatus": "DIRECT_DISPATCH",
-            "dispatch": dispatch_result,
-        }
     await db.commit()
     await db.refresh(task)
     queue_status = await _enqueue_after_commit(task)
@@ -202,13 +182,20 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
     retry_map_version, retry_map_graph = await get_map_graph(db)
     retry_map_graph.require_nodes(retry_sites)
 
+    retry_input_params = from_json_text(source.input_params, {})
+    retry_input_params["from"] = None
+    retry_input_params["to"] = retry_sites[-1]
+    retry_input_params["sitePath"] = retry_sites
+    retry_input_params["vehicle"] = ""
+    retry_input_params["scriptName"] = None
+    retry_path = build_route(retry_sites)
     cloned = WindTaskRecord(
         def_id=source.def_id,
         def_label=source.def_label,
         def_version=source.def_version,
         status=TaskStatus.PENDING_ASSIGN,
-        input_params=source.input_params,
-        path=source.path,
+        input_params=to_json_text(retry_input_params),
+        path=to_json_text(retry_path),
         map_version_id=retry_map_version.id,
         variables=source.variables,
         task_def_detail=source.task_def_detail,
@@ -224,7 +211,6 @@ async def retry_task(db: AsyncSession, task_id: int, reason: str | None) -> dict
     cloned.variables = to_json_text(variables)
     db.add(cloned)
     await db.flush()
-    await create_initial_block_plan(db, cloned)
     create_task_log(db, cloned.id, f"任务由 {source.id} 重试创建")
     create_task_log(db, source.id, f"任务触发重试，新任务={cloned.id}")
     await db.commit()
